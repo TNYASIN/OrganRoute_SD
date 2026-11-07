@@ -5,7 +5,7 @@ Owners:
   - load_flights / synthetic data ...... Data person (DS #1)
   - p_on_time (delay model) ............ Model person (DS #2 / Math-CS)
   - build_options / replan ............. Math-CS
-  - gemini_plan ........................ App person (CS/CompE)
+  - llm_plan (Claude/OpenAI/Gemini) ..... App person (CS/CompE)
 
 All times are handled as San Diego local time (datetime objects).
 """
@@ -292,7 +292,7 @@ def status_color(minutes_to_spare: int, p: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gemini  (CS/CompE)
+# LLM planner, provider-pluggable  (CS/CompE)
 # ---------------------------------------------------------------------------
 
 SYSTEM = """You are a transport decision-support assistant for an organ procurement coordinator in San Diego.
@@ -306,24 +306,101 @@ Return JSON with keys:
 """
 
 
-def gemini_plan(context: dict) -> tuple[dict, str]:
-    """Returns (plan_json, source). Falls back to rules if no key/SDK so the demo never breaks."""
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["green", "yellow", "red"]},
+        "recommendation": {"type": "string"},
+        "reasoning": {"type": "string"},
+        "notify": {"type": "array", "items": {"type": "string"}},
+        "message_draft": {"type": "string"},
+    },
+    "required": ["status", "recommendation", "reasoning", "notify", "message_draft"],
+    "additionalProperties": False,
+}
+
+# Switch providers with one env var:  AI_PROVIDER=claude | openai | gemini
+# Override the model with AI_MODEL (otherwise the default below is used).
+PROVIDERS = {
+    #  name      default model        API key env var(s)
+    "claude": ("claude-opus-5-5",  ["ANTHROPIC_API_KEY"]),
+    "openai": ("gpt-5-mini",       ["OPENAI_API_KEY"]),
+    "gemini": ("gemini-2.5-flash", ["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+}
+PROVIDER_LABELS = {"claude": "Claude", "openai": "OpenAI", "gemini": "Gemini"}
+
+
+def _situation(context: dict) -> str:
+    return "SITUATION (JSON):\n" + json.dumps(context, default=str, indent=1)
+
+
+def _call_claude(context: dict, model: str) -> dict:
+    import anthropic
+    client = anthropic.Anthropic()
+    resp = client.beta.messages.create(
+        model=model,
+        max_tokens=4000,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": _situation(context)}],
+        output_config={"effort": "low",  # fast enough for a live demo
+                       "format": {"type": "json_schema", "schema": PLAN_SCHEMA}},
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",  # if a safety filter declines, the API retries on another model
+    )
+    if resp.stop_reason == "refusal":
+        raise RuntimeError("Claude declined the request")
+    return json.loads(next(b.text for b in resp.content if b.type == "text"))
+
+
+def _call_openai(context: dict, model: str) -> dict:
+    from openai import OpenAI
+    client = OpenAI()
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": SYSTEM},
+                  {"role": "user", "content": _situation(context)}],
+        response_format={"type": "json_schema",
+                         "json_schema": {"name": "plan", "strict": True, "schema": PLAN_SCHEMA}},
+    )
+    return json.loads(resp.choices[0].message.content)
+
+
+def _call_gemini(context: dict, model: str) -> dict:
+    from google import genai
     key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if key:
-        try:
-            from google import genai
-            client = genai.Client(api_key=key)
-            resp = client.models.generate_content(
-                model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
-                contents=SYSTEM + "\n\nSITUATION (JSON):\n" + json.dumps(context, default=str, indent=1),
-                config={"response_mime_type": "application/json", "temperature": 0.2},
-            )
-            return json.loads(resp.text), "gemini"
-        except Exception as e:  # show error in UI but keep going
-            fb = rule_plan(context)
-            fb["reasoning"] += f" (Gemini error, rule fallback: {e})"
-            return fb, "fallback"
-    return rule_plan(context), "fallback"
+    client = genai.Client(api_key=key)
+    resp = client.models.generate_content(
+        model=model,
+        contents=SYSTEM + "\n\n" + _situation(context),
+        config={"response_mime_type": "application/json", "temperature": 0.2},
+    )
+    return json.loads(resp.text)
+
+
+_CALLERS = {"claude": _call_claude, "openai": _call_openai, "gemini": _call_gemini}
+
+
+def llm_plan(context: dict) -> tuple[dict, str]:
+    """Returns (plan_json, source). source is the provider name or "fallback".
+    Falls back to rules if no key/SDK/error so the demo never breaks."""
+    provider = os.environ.get("AI_PROVIDER", "claude").lower()
+    if provider not in PROVIDERS:
+        fb = rule_plan(context)
+        fb["reasoning"] += f" (Unknown AI_PROVIDER '{provider}', rule fallback.)"
+        return fb, "fallback"
+    default_model, key_vars = PROVIDERS[provider]
+    if not any(os.environ.get(k) for k in key_vars):
+        return rule_plan(context), "fallback"
+    try:
+        model = os.environ.get("AI_MODEL", default_model)
+        return _CALLERS[provider](context, model), provider
+    except Exception as e:  # show error in UI but keep going
+        fb = rule_plan(context)
+        fb["reasoning"] += f" ({PROVIDER_LABELS[provider]} error, rule fallback: {e})"
+        return fb, "fallback"
+
+
+gemini_plan = llm_plan  # backwards-compatible alias
 
 
 def rule_plan(context: dict) -> dict:

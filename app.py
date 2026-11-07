@@ -36,7 +36,7 @@ def plan_card(plan: dict, source: str):
         <div>{plan.get('reasoning','')}</div></div>""", unsafe_allow_html=True)
     st.write("**Notify:** " + ", ".join(plan.get("notify", [])))
     st.text_area("Draft message to team", plan.get("message_draft", ""), height=90)
-    st.caption(f"Plan source: {'Gemini' if source == 'gemini' else 'rule-based fallback'}")
+    st.caption(f"Plan source: {core.PROVIDER_LABELS.get(source, 'rule-based fallback')}")
 
 
 def options_table(opts):
@@ -78,7 +78,7 @@ with tab1:
         ctx = {"phase": "planning", "organ": organ, "origin": origin, "hospital": hospital,
                "crossclamp": crossclamp, "deadline": dl, "options": [asdict(o) for o in opts]}
         with st.spinner("Thinking..."):
-            st.session_state["plan1"] = core.gemini_plan(ctx)
+            st.session_state["plan1"] = core.llm_plan(ctx)
     if "plan1" in st.session_state:
         plan_card(*st.session_state["plan1"])
 
@@ -102,7 +102,7 @@ with tab2:
             ctx = {"phase": "replan", "organ": organ, "origin": origin, "hospital": hospital,
                    "booked_flight": asdict(chosen), "delay_minutes": delay, "replan": rp}
             with st.spinner("Re-planning..."):
-                st.session_state["rp"] = (rp, core.gemini_plan(ctx))
+                st.session_state["rp"] = (rp, core.llm_plan(ctx))
         if "rp" in st.session_state:
             rp, plan = st.session_state["rp"]
             c1, c2, c3 = st.columns(3)
