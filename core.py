@@ -504,7 +504,7 @@ PROVIDERS = {
     #  name      default model        API key env var(s)
     "claude": ("claude-opus-5-5",  ["ANTHROPIC_API_KEY"]),
     "openai": ("gpt-5-mini",       ["OPENAI_API_KEY"]),
-    "gemini": ("gemini-2.5-flash", ["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+    "gemini": ("gemini-3.8-flash", ["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
 }
 PROVIDER_LABELS = {"claude": "Claude", "openai": "OpenAI", "gemini": "Gemini"}
 
