@@ -1,6 +1,7 @@
 """OrganRoute SD - Streamlit UI.  Run:  streamlit run app.py"""
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -8,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 import core
+from claude_recovery_agent import ClaudeRecoveryAgent
 from recovery import DisruptionEvent, EventType, TransportStage
 from recovery_agent import EventEnvelope, RecoveryAgent
 from recovery_demo import demo_mission
@@ -127,9 +129,21 @@ with tab3:
     st.warning("All flights, airport transfers, and ground durations in this tab are hypothetical. "
                "Nothing here is a live schedule, carrier acceptance, or booking.")
     agent = RecoveryAgent(Path(__file__).with_name("recovery_demo.sqlite3"))
+
+    def run_claude_recovery(mission_id: str):
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            return
+        try:
+            with st.spinner("Claude is investigating recovery options with tools..."):
+                ClaudeRecoveryAgent(agent).analyze(mission_id)
+        except Exception as exc:
+            st.error(f"Claude assessment failed: {exc}")
+
     with st.form("new_recovery_mission"):
         demo_organ = st.selectbox("Organ for simulated mission", list(core.VIABILITY_HOURS),
                                   key="demo_organ")
+        demo_hospital = st.selectbox("Receiving hospital", list(core.HOSPITALS),
+                                     key="demo_hospital")
         deadline_hours = st.number_input("User-specified deadline: hours from mission start",
                                          min_value=1, max_value=48, value=6)
         create_demo = st.form_submit_button("Create simulated PHX → San Diego mission")
@@ -137,7 +151,8 @@ with tab3:
         started = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         mission_id = f"demo-{uuid4().hex[:12]}"
         agent.create_mission(demo_mission(mission_id, started,
-                                          started + timedelta(hours=int(deadline_hours)), demo_organ))
+                                          started + timedelta(hours=int(deadline_hours)), demo_organ,
+                                          demo_hospital, core.HOSPITALS[demo_hospital][0]))
         st.session_state["recovery_mission_id"] = mission_id
 
     mission_id = st.session_state.get("recovery_mission_id")
@@ -147,10 +162,12 @@ with tab3:
                    f"Deadline: {mission.deadline.isoformat()}")
         if mission.stage == TransportStage.ORIGIN and st.button("Simulate organ boarded current flight"):
             agent.set_stage(mission_id, TransportStage.ONBOARD, "ONBOARD_DEMO_CURRENT")
+            run_claude_recovery(mission_id)
             mission = agent.get_mission(mission_id)
         if mission.stage == TransportStage.ONBOARD and mission.diverted_to and st.button(
                 "Simulate landing at diversion airport"):
             agent.set_stage(mission_id, TransportStage.TRANSFER, mission.diverted_to)
+            run_claude_recovery(mission_id)
             mission = agent.get_mission(mission_id)
 
         with st.form("recovery_event"):
@@ -176,6 +193,7 @@ with tab3:
                 else:
                     event = DisruptionEvent(event_type, occurred)
                 agent.handle_event(EventEnvelope(mission_id, uuid4().hex, event))
+                run_claude_recovery(mission_id)
             except ValueError as exc:
                 st.error(str(exc))
 
@@ -218,4 +236,19 @@ with tab3:
                     st.success("Review recorded. Transport and handoffs still need confirmation.")
             with st.expander("Agent tool trace"):
                 st.json(report["agent_trace"])
+            if not os.getenv("ANTHROPIC_API_KEY"):
+                st.info("Claude recovery agent is not configured. Set ANTHROPIC_API_KEY, "
+                        "then run a new event or click below.")
+            if st.button("Run Claude tool agent for this plan"):
+                run_claude_recovery(mission_id)
+            assessment = agent.get_ai_assessment(mission_id, report["mission_version"])
+            if assessment:
+                st.subheader("Claude tool agent assessment")
+                st.caption(f"Model: {assessment['model']} · Plan version: {assessment['plan_version']} · "
+                           "Human approval required")
+                st.write(assessment["agent_reasoning"])
+                st.write("Selected computed candidates", assessment["selected_options"])
+                st.write("Questions to verify", assessment["verification_questions"])
+                with st.expander("Claude tool calls"):
+                    st.json(assessment["tool_trace"])
             st.caption(report["uncertainty"])

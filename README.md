@@ -23,10 +23,12 @@ streamlit run app.py
 ## Recovery agent demo
 
 The **Recovery agent demo** tab is separate from the original planner. Create a
-simulated mission, enter a transport deadline, and apply a delay, cancellation,
+simulated mission, choose a receiving hospital, enter a transport deadline, and apply a delay, cancellation,
 diversion, or ETA update. The mission starts at a named **hypothetical donor site**;
 the agent examines transfers to both PHX and AZA instead of asking you to pick
-the nearest airport. It stores mission state and plan versions in
+the nearest airport. The hospital list and SAN ground-time reference come from
+the existing `core.py`; the demo flight and transfer times remain hypothetical.
+It stores mission state and plan versions in
 `recovery_demo.sqlite3` (ignored by Git). It requires no LLM key or extra package.
 
 The demo catalog contains invented PHX/AZA/SAN/LAX flight and ground scenarios.
@@ -38,10 +40,34 @@ The **Record review** action stores a human review of the current plan version;
 it does not confirm transport availability, book a carrier, or authorize a
 medical decision.
 
+### Claude tool agent
+
+Set `ANTHROPIC_API_KEY` in the process environment to enable Claude's real
+client-side tool-use loop. The Anthropic SDK is already in `requirements.txt`.
+On PowerShell, before starting Streamlit or the worker:
+
+```powershell
+$env:ANTHROPIC_API_KEY = "your-key-here"
+$env:RECOVERY_CLAUDE_MODEL = "claude-opus-5-5"  # optional override
+streamlit run app.py
+```
+
+When a new recovery event arrives, Claude reads the saved mission, can inspect
+the existing `core.py` reference assumptions, lists and inspects computed
+candidates, and submits a structured shortlist. The app validates every selected
+candidate ID against the deterministic plan, rejects infeasible or invented
+routes, and caches the assessment by plan version. The worker also runs Claude
+automatically for new events when the key is set. Without a key, it reports that
+Claude is not configured; it does not label the rule plan as an AI assessment.
+
+The recovery workflow currently accepts simulation missions only. User account
+authentication is not connected yet; the review button records a demo review,
+not an authenticated authorization. Do not put API keys in source files or Git.
+
 Run the deterministic backend tests:
 
 ```bash
-python -m unittest -v test_recovery.py test_recovery_agent.py
+python -m unittest -v test_recovery.py test_recovery_agent.py test_claude_recovery_agent.py
 ```
 
 For event-driven operation, start the worker in a second terminal after creating
@@ -66,7 +92,7 @@ event source, not a live flight feed.
 
 The original two tabs retain their existing code and may call the legacy LLM
 planner when a corresponding API key is configured. The recovery tab and worker
-make no LLM calls.
+use the separate Claude tool agent described above.
 
 ## How it works
 - **Delay model:** empirical arrival-delay distribution for each origin × airline × departure hour (falling back to coarser slices when there's too little data). P(on time) = P(arrival delay ≤ slack) × (1 − cancellation rate), where slack = deadline − scheduled arrival at the hospital.

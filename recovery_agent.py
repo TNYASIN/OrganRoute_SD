@@ -245,10 +245,13 @@ class RecoveryAgent:
         """Poll a source and automatically replan every new event."""
         return [self.handle_event(envelope) for envelope in source.poll()]
 
-    def run_forever(self, source: EventSource, interval_seconds: float = 2) -> None:
+    def run_forever(self, source: EventSource, interval_seconds: float = 2,
+                    on_report: Callable[[dict], None] | None = None) -> None:
         """Run the read-only event poll and planning loop until interrupted."""
         if interval_seconds <= 0:
             raise ValueError("poll interval must be positive")
         while True:
-            self.run_once(source)
+            for report in self.run_once(source):
+                if on_report is not None:
+                    on_report(report)
             time.sleep(interval_seconds)
