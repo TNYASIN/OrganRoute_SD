@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 
 import core
+import notify
 
 st.set_page_config(page_title="OrganRoute SD", page_icon="🫀", layout="wide")
 COLORS = {"green": "#1e8e3e", "yellow": "#f9ab00", "red": "#d93025"}
@@ -27,7 +28,12 @@ else:
     st.caption(f"Delay model built on {len(df):,} real BTS flights into SAN.")
 
 
+_cards = []  # reset every rerun; gives each plan card's widgets a unique key
+
+
 def plan_card(plan: dict, source: str):
+    key = f"card{len(_cards)}"
+    _cards.append(key)
     c = COLORS.get(plan.get("status", "yellow"), "#888")
     st.markdown(
         f"""<div style="border-left:10px solid {c};padding:14px 18px;border-radius:8px;background:rgba(127,127,127,.08)">
@@ -35,8 +41,17 @@ def plan_card(plan: dict, source: str):
         <div style="font-size:1.1rem;font-weight:600;margin:6px 0">{plan.get('recommendation','')}</div>
         <div>{plan.get('reasoning','')}</div></div>""", unsafe_allow_html=True)
     st.write("**Notify:** " + ", ".join(plan.get("notify", [])))
-    st.text_area("Draft message to team", plan.get("message_draft", ""), height=90)
+    msg = st.text_area("Draft message to team", plan.get("message_draft", ""), height=90, key=f"{key}_msg")
     st.caption(f"Plan source: {core.PROVIDER_LABELS.get(source, 'rule-based fallback')}")
+    if notify.enabled():
+        n = len(notify.recipients())
+        if st.button(f"📲 Send to team ({notify.channel()}, {n} recipient{'s' * (n != 1)})", key=f"{key}_send"):
+            title = f"OrganRoute {plan.get('status', '').upper()}: {plan.get('recommendation', '')}"[:120]
+            with st.spinner("Sending..."):
+                ok, note = notify.send_alert(title, msg, plan.get("status", "yellow"))
+            (st.success if ok else st.error)(note)
+    else:
+        st.caption("📲 Team alerts are off. Add Twilio settings to .env to send this message (see .env.example).")
 
 
 def options_table(opts):
