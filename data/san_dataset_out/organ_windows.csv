@@ -1,0 +1,7 @@
+organ,window_min_hours,window_max_hours,usually_commercial_air,source
+kidney,24,36,yes,https://www.life-source.org/latest/how-long-can-an-organ-be-outside-the-body-before-transplant/
+pancreas,12,18,sometimes,https://www.life-source.org/latest/how-long-can-an-organ-be-outside-the-body-before-transplant/
+liver,8,12,rarely,https://www.life-source.org/latest/how-long-can-an-organ-be-outside-the-body-before-transplant/
+intestine,8,16,rarely,https://www.life-source.org/latest/how-long-can-an-organ-be-outside-the-body-before-transplant/
+lung,4,8,no,https://www.life-source.org/latest/how-long-can-an-organ-be-outside-the-body-before-transplant/
+heart,4,6,no,https://www.life-source.org/latest/how-long-can-an-organ-be-outside-the-body-before-transplant/
