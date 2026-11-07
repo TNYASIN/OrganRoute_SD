@@ -7,3 +7,5 @@ google-genai
 python-dotenv
 scikit-learn==1.6.1
 joblib
+certifi
+twilio

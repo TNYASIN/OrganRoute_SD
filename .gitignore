@@ -16,3 +16,7 @@ recovery_demo_events.jsonl
 
 # macOS
 .DS_Store
+.DS_Store
+*.zip
+*.zip
+.aeroapi_usage.json

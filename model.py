@@ -678,6 +678,7 @@ def predict_risk(
 
     # Load model with compatibility fix.
     bundle = loaded_bundle if loaded_bundle is not None else _load_model(model_path)
+    bundle = _load_model(model_path)
 
     X = _make_features(
         pd.DataFrame([{
