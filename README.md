@@ -20,7 +20,8 @@ streamlit run app.py
 
 ## How it works
 - **Delay model:** empirical arrival-delay distribution for each origin × airline × departure hour (falling back to coarser slices when there's too little data). P(on time) = P(arrival delay ≤ slack) × (1 − cancellation rate), where slack = deadline − scheduled arrival at the hospital.
-- **Charter / ground:** distance-based estimates with stated assumptions (see constants in `core.py`).
+- **Charter:** enter the booking (wheels-up time, aircraft, arrival airport) or use an estimate. On-time chance starts at an assumed 95% and is adjusted by live aviation forecasts (TAF from aviationweather.gov) at departure and arrival using stated rules; no public charter delay data exists to train on. A "simulate San Diego weather" option shows the effect of fog or storms in a demo.
+- **Ground:** distance-based estimate with stated assumptions (see constants in `core.py`).
 - **LLM planner** (`llm_plan` in `core.py`) reasons over the computed options and returns schema-validated JSON. Set `AI_PROVIDER` to `claude` (default, `claude-opus-5-5`), `openai` (`gpt-5-mini`), or `gemini` (`gemini-2.5-flash`); `AI_MODEL` overrides the model.
 
 ## AI tools used

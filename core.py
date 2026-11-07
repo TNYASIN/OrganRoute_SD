@@ -14,8 +14,13 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass, asdict
+import ssl
+import time
+import urllib.request
+from dataclasses import dataclass, asdict, replace
 from datetime import datetime, timedelta
+from fractions import Fraction
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -225,15 +230,122 @@ def commercial_options(df, origin, hospital, ready_at_airport: datetime, dl: dat
     return [o for _, o in out[:n]]
 
 
-def charter_option(origin, hospital, ready_at_origin_hosp: datetime, dl: datetime) -> Option:
-    miles = haversine_miles(AIRPORTS[origin][:2], MYF)
-    dep = ready_at_origin_hosp + timedelta(hours=CHARTER_CALLOUT_H)
-    arr = dep + timedelta(hours=miles / CHARTER_MPH + 0.3)
-    at_hosp = arr + timedelta(minutes=HOSPITALS[hospital][1])
+# ---------------------------------------------------------------------------
+# Charter: entered booking details + live aviation weather forecast (TAF).
+# No public charter delay data exists, so weather effects are stated RULES (assumptions), not a trained model.
+# ---------------------------------------------------------------------------
+
+CHARTER_AIRCRAFT_MPH = {"Light jet": 420, "Midsize jet": 470, "Turboprop": 300}  # cruise, assumption
+CHARTER_TAXI_H = 0.3                     # taxi, climb, descent overhead
+# arrival airport -> (name, coords, index into HOSPITALS ground-time tuple)
+CHARTER_ARRIVAL = {"MYF": ("Montgomery-Gibbs (MYF)", MYF, 1), "SAN": ("San Diego Intl (SAN)", SAN, 0)}
+TAF_STATION = {"MYF": "KSAN"}            # MYF publishes no TAF; SAN is ~8 mi away
+# flight category -> (reliability multiplier, extra minutes)  -- per airport, assumption
+WX_IMPACT = {"VFR": (1.00, 0), "MVFR": (0.97, 10), "IFR": (0.90, 25), "TS": (0.80, 30), "LIFR": (0.75, 45)}
+WX_LABELS = {"VFR": "clear (VFR)", "MVFR": "marginal (MVFR)", "IFR": "low clouds/poor visibility (IFR)",
+             "TS": "thunderstorms", "LIFR": "fog / very low ceiling (LIFR)"}
+SD_TZ = ZoneInfo("America/Los_Angeles")
+
+
+@dataclass
+class CharterDetails:
+    wheels_up: datetime | None = None    # None -> estimate: ready time + callout
+    aircraft: str = "Light jet"
+    arrive: str = "MYF"
+    operator: str = ""
+    sd_weather: str = "Live forecast"    # or a WX_IMPACT key to simulate San Diego weather (demo)
+
+
+_TAF_CACHE: dict[str, tuple[float, list | None]] = {}
+try:  # python.org macOS builds often lack system CA certs; certifi's bundle fixes HTTPS verification
+    import certifi
+    _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL_CTX = ssl.create_default_context()
+
+
+def fetch_taf(icao: str) -> list[dict] | None:
+    """Forecast periods from aviationweather.gov (free, no key). Cached 10 min; None if unavailable."""
+    hit = _TAF_CACHE.get(icao)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    try:
+        req = urllib.request.Request(f"https://aviationweather.gov/api/data/taf?ids={icao}&format=json",
+                                     headers={"User-Agent": "OrganRoute-SD"})
+        with urllib.request.urlopen(req, timeout=8, context=_SSL_CTX) as r:
+            data = json.load(r)
+        fc = data[0]["fcsts"] if data else None
+    except Exception:
+        fc = None
+    _TAF_CACHE[icao] = (time.time(), fc)
+    return fc
+
+
+def _flight_category(period: dict) -> str:
+    """FAA categories from visibility (statute miles) and ceiling (lowest BKN/OVC layer, ft)."""
+    if "TS" in (period.get("wxString") or ""):
+        return "TS"
+    try:
+        vis = float(sum(Fraction(p) for p in str(period.get("visib") or "10").replace("+", "").split()))
+    except (ValueError, ZeroDivisionError):
+        vis = 10.0
+    bases = [c["base"] for c in period.get("clouds") or []
+             if c.get("cover") in ("BKN", "OVC", "OVX", "VV") and c.get("base") is not None]
+    ceil = min(bases) if bases else 99999
+    if ceil < 500 or vis < 1:
+        return "LIFR"
+    if ceil < 1000 or vis < 3:
+        return "IFR"
+    if ceil <= 3000 or vis <= 5:
+        return "MVFR"
+    return "VFR"
+
+
+def weather_at(airport: str, when: datetime) -> tuple[str | None, str]:
+    """Worst forecast category at `airport` (IATA) around `when` (SD local). Includes TEMPO/PROB periods."""
+    icao = TAF_STATION.get(airport, "K" + airport)
+    fc = fetch_taf(icao)
+    if not fc:
+        return None, f"{icao} forecast unavailable"
+    ts = when.replace(tzinfo=SD_TZ).timestamp()
+    cats = [_flight_category(f) for f in fc if f["timeFrom"] <= ts < f["timeTo"]]
+    if not cats:
+        return None, f"{icao}: beyond forecast range"
+    worst = min(cats, key=lambda c: WX_IMPACT[c][0])
+    return worst, f"{icao} {worst}"
+
+
+def charter_option(origin, hospital, ready_at_origin_hosp: datetime, dl: datetime,
+                   details: CharterDetails | None = None) -> Option:
+    d = details or CharterDetails()
+    estimate = d.wheels_up is None
+    dep = d.wheels_up or ready_at_origin_hosp + timedelta(hours=CHARTER_CALLOUT_H)
+    mph = CHARTER_AIRCRAFT_MPH[d.aircraft]
+    arr_name, arr_coords, ground_idx = CHARTER_ARRIVAL[d.arrive]
+    miles = haversine_miles(AIRPORTS[origin][:2], arr_coords)
+    arr = dep + timedelta(hours=miles / mph + CHARTER_TAXI_H)
+
+    o_cat, o_note = weather_at(origin, dep)
+    if d.sd_weather in WX_IMPACT:
+        a_cat, a_note = d.sd_weather, f"SIMULATED {d.sd_weather}"
+    else:
+        a_cat, a_note = weather_at(d.arrive, arr)
+    p, extra = CHARTER_RELIABILITY, 0
+    for cat in (o_cat, a_cat):
+        if cat:
+            p *= WX_IMPACT[cat][0]
+            extra += WX_IMPACT[cat][1]
+
+    at_hosp = arr + timedelta(minutes=extra + HOSPITALS[hospital][ground_idx])
     slack = (dl - at_hosp).total_seconds() / 60
-    p = CHARTER_RELIABILITY if slack >= 0 else 0.0
-    return Option("Charter", f"Charter jet {origin} -> Montgomery-Gibbs (MYF)", _fmt(dep), _fmt(at_hosp),
-                  int(slack), round(p, 3), "$$$$", f"{miles:.0f} mi @ {CHARTER_MPH} mph + {CHARTER_CALLOUT_H}h callout (assumption)")
+    who = f"{d.operator} " if d.operator else ""
+    label = f"Charter {who}{d.aircraft.lower()} {origin} -> {arr_name}"
+    if estimate:
+        label += " (estimate)"
+    basis = (f"{miles:.0f} mi @ {mph} mph{f', {CHARTER_CALLOUT_H}h callout' if estimate else ''}; "
+             f"wx {o_note} / {a_note}{f', +{extra} min' if extra else ''} (rules, assumption)")
+    return Option("Charter", label, _fmt(dep), _fmt(at_hosp), int(slack),
+                  round(p, 3) if slack >= 0 else 0.0, "$$$$", basis)
 
 
 def ground_option(origin, hospital, ready_at_origin_hosp: datetime, dl: datetime) -> Option | None:
@@ -250,14 +362,15 @@ def ground_option(origin, hospital, ready_at_origin_hosp: datetime, dl: datetime
 MODES = ["Compare all", "Commercial", "Charter", "Ground"]
 
 
-def build_options(df, organ, origin, hospital, crossclamp: datetime,
-                  mode: str = "Compare all") -> tuple[datetime, list[Option]]:
-    """mode limits the options to one transport type (e.g. when the team always charters)."""
+def build_options(df, organ, origin, hospital, crossclamp: datetime, mode: str = "Compare all",
+                  charter: CharterDetails | None = None) -> tuple[datetime, list[Option]]:
+    """mode limits the options to one transport type (e.g. when the team always charters).
+    charter holds the booked charter's details; None means a generic estimate."""
     dl = deadline(organ, crossclamp)
     ready_hosp = crossclamp  # organ leaves donor hospital at cross-clamp (simplification)
     ready_airport = ready_hosp + timedelta(minutes=ORIGIN_HOSPITAL_TO_AIRPORT_MIN)
     opts = commercial_options(df, origin, hospital, ready_airport, dl)
-    opts.append(charter_option(origin, hospital, ready_hosp, dl))
+    opts.append(charter_option(origin, hospital, ready_hosp, dl, charter))
     g = ground_option(origin, hospital, ready_hosp, dl)
     if g:
         opts.append(g)
@@ -273,7 +386,7 @@ def rank(opts: list[Option]) -> list[Option]:
 
 
 def replan(df, organ, origin, hospital, crossclamp: datetime, chosen: Option,
-           delay_min: int, now: datetime, departed: bool) -> dict:
+           delay_min: int, now: datetime, departed: bool, charter: CharterDetails | None = None) -> dict:
     """Recompute after a delay alert on the booked option (commercial, charter, or ground).
     Backups always include every transport type: in a delay, any mode is on the table."""
     dl = deadline(organ, crossclamp)
@@ -287,12 +400,15 @@ def replan(df, organ, origin, hospital, crossclamp: datetime, chosen: Option,
     backups: list[Option] = []
     if not departed:
         backups += [o for o in commercial_options(df, origin, hospital, now, dl, n=4) if o.label != chosen.label][:3]
+        # backup charter: same aircraft/airport/weather settings, but timed from now (no booked wheels-up)
+        alt_details = replace(charter or CharterDetails(), wheels_up=None, operator="")
         if chosen.mode == "Charter":
             # booked charter is stuck: a second operator needs a full callout from now
-            alt = charter_option(origin, hospital, now, dl)
-            alt.label = f"Backup charter (different operator) {origin} -> MYF"
+            alt = charter_option(origin, hospital, now, dl, alt_details)
+            alt.label = "Backup charter (different operator) " + alt.label.split(" ", 1)[1].replace(" (estimate)", "")
         else:
-            alt = charter_option(origin, hospital, now - timedelta(minutes=ORIGIN_HOSPITAL_TO_AIRPORT_MIN), dl)
+            alt = charter_option(origin, hospital, now - timedelta(minutes=ORIGIN_HOSPITAL_TO_AIRPORT_MIN), dl,
+                                 alt_details)
         backups.append(alt)
         if chosen.mode != "Ground":
             g = ground_option(origin, hospital, now, dl)

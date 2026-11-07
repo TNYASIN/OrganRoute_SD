@@ -65,11 +65,15 @@ with st.sidebar:
                     help="Pick one type if your team already knows how this organ will travel "
                          "(e.g. a recovery team that always flies charter). 'Compare all' ranks every option.")
 
+CHARTER_CAVEAT = ("**Charter delays aren't in any public dataset**, so the charter's on-time chance starts from an "
+                  f"assumed {core.CHARTER_RELIABILITY:.0%} and is adjusted by the live aviation forecast at departure "
+                  "and arrival (stated rules, not a trained model). Enter the booking under *Charter details*; "
+                  "use tab 2 for crew or mechanical delays.")
 MODE_NOTES = {
+    "Compare all": "Commercial on-time chances come from real BTS delay history; ground and charter are estimates. "
+                   + CHARTER_CAVEAT,
     "Commercial": "Showing scheduled flights into SAN only. On-time chances come from real BTS delay history.",
-    "Charter": "Showing charter only. **Charter delays aren't in any public dataset**, so its on-time chance is an "
-               f"assumption ({core.CHARTER_RELIABILITY:.0%} reliability, {core.CHARTER_CALLOUT_H} h callout), not a "
-               "prediction. Main risks are weather, crew availability, and mechanical issues; use tab 2 to plan for a delay.",
+    "Charter": "Showing charter only. " + CHARTER_CAVEAT,
     "Ground": "Showing ground courier only (within ~400 road miles). Travel time is a distance-based estimate.",
 }
 
@@ -77,8 +81,7 @@ tab1, tab2 = st.tabs(["1 · Plan transport", "2 · Delay alert → re-plan"])
 
 # ---------------- Tab 1: Planning ----------------
 with tab1:
-    dl, opts = core.build_options(df, organ, origin, hospital, crossclamp, mode)
-    st.session_state["opts"] = opts
+    dl = core.deadline(organ, crossclamp)
     c1, c2, c3 = st.columns(3)
     c1.metric("Cross-clamp", crossclamp.strftime("%I:%M %p"))
     c2.metric("Must arrive by", dl.strftime("%a %I:%M %p"))
@@ -86,6 +89,38 @@ with tab1:
     st.subheader("Options")
     if mode in MODE_NOTES:
         st.info(MODE_NOTES[mode])
+
+    charter = None
+    if mode in ("Compare all", "Charter"):
+        with st.expander("✈️ Charter details", expanded=(mode == "Charter")):
+            booked = st.toggle("I have a charter booking",
+                               help="Without one, the app estimates a charter leaving "
+                                    f"{core.CHARTER_CALLOUT_H} h after cross-clamp.")
+            a1, a2 = st.columns(2)
+            aircraft = a1.selectbox("Aircraft", list(core.CHARTER_AIRCRAFT_MPH),
+                                    format_func=lambda a: f"{a} (~{core.CHARTER_AIRCRAFT_MPH[a]} mph)")
+            arrive = a2.selectbox("Arrival airport", list(core.CHARTER_ARRIVAL),
+                                  format_func=lambda a: core.CHARTER_ARRIVAL[a][0])
+            wheels_up, operator = None, ""
+            if booked:
+                b1, b2, b3 = st.columns(3)
+                operator = b1.text_input("Operator (optional)")
+                default_wu = crossclamp + timedelta(hours=core.CHARTER_CALLOUT_H)
+                wu_date = b2.date_input("Wheels-up date", default_wu.date())
+                wu_time = b3.time_input("Wheels-up time (San Diego time)", default_wu.time())
+                wheels_up = datetime.combine(wu_date, wu_time)
+            sd_weather = st.selectbox(
+                "San Diego weather", ["Live forecast"] + [k for k in core.WX_IMPACT if k != "VFR"],
+                format_func=lambda k: k if k == "Live forecast" else f"Simulate: {core.WX_LABELS[k]}",
+                help="Simulate bad arrival weather for a demo. San Diego's marine-layer fog is a real risk.")
+            charter = core.CharterDetails(wheels_up, aircraft, arrive, operator.strip(), sd_weather)
+            rules = ", ".join(f"{k} −{1 - f:.0%} / +{m} min" for k, (f, m) in core.WX_IMPACT.items() if k != "VFR")
+            st.caption(f"Forecasts from aviationweather.gov (MYF uses SAN's, ~8 mi away). "
+                       f"Weather rules per airport (assumptions): {rules}.")
+    st.session_state["charter"] = charter
+
+    dl, opts = core.build_options(df, organ, origin, hospital, crossclamp, mode, charter)
+    st.session_state["opts"] = opts
     if not opts and mode == "Ground":
         st.warning(f"{origin} is too far for ground transport. Try Charter or Compare all.")
     options_table(opts)
@@ -126,7 +161,8 @@ with tab2:
             if alert_time < crossclamp:
                 alert_time += timedelta(days=1)
             alert_time -= timedelta(minutes=30)  # alert arrives ~30 min before scheduled departure
-            rp = core.replan(df, organ, origin, hospital, crossclamp, chosen, delay, alert_time, departed)
+            rp = core.replan(df, organ, origin, hospital, crossclamp, chosen, delay, alert_time, departed,
+                             st.session_state.get("charter"))
             ctx = {"phase": "replan", "organ": organ, "origin": origin, "hospital": hospital,
                    "booked_transport": asdict(chosen), "delay_minutes": delay, "delay_cause": cause,
                    "replan": rp}
