@@ -247,6 +247,11 @@ WX_LABELS = {"VFR": "clear (VFR)", "MVFR": "marginal (MVFR)", "IFR": "low clouds
 SD_TZ = ZoneInfo("America/Los_Angeles")
 
 
+def sd_now() -> datetime:
+    """Current San Diego time (naive), whatever timezone the computer or server is set to."""
+    return datetime.now(SD_TZ).replace(tzinfo=None, second=0, microsecond=0)
+
+
 @dataclass
 class CharterDetails:
     wheels_up: datetime | None = None    # None -> estimate: ready time + callout

@@ -155,7 +155,7 @@ def aeroapi_usage() -> tuple[int, int]:
     try:
         with open(USAGE_FILE) as f:
             u = json.load(f)
-        calls = u.get("calls", 0) if u.get("month") == datetime.now().strftime("%Y-%m") else 0
+        calls = u.get("calls", 0) if u.get("month") == datetime.now(SD_TZ).strftime("%Y-%m") else 0
     except (OSError, ValueError):
         calls = 0
     return calls, cap
@@ -165,7 +165,7 @@ def _count_call() -> None:
     calls, _ = aeroapi_usage()
     try:
         with open(USAGE_FILE, "w") as f:
-            json.dump({"month": datetime.now().strftime("%Y-%m"), "calls": calls + 1}, f)
+            json.dump({"month": datetime.now(SD_TZ).strftime("%Y-%m"), "calls": calls + 1}, f)
     except OSError:
         pass
 
@@ -217,7 +217,7 @@ def flight_status(ident: str, near: datetime) -> dict:
             {"ok": False, "note": f"FlightAware has no flights for {ident}."}
     except Exception as e:
         res = {"ok": False, "note": f"FlightAware error: {type(e).__name__} {str(e)[:80]}"}
-    res.setdefault("note", f"FlightAware, checked {datetime.now().strftime('%I:%M %p')} "
+    res.setdefault("note", f"FlightAware, checked {datetime.now(SD_TZ).strftime('%I:%M %p')} "
                            f"({aeroapi_usage()[0]}/{cap} calls this month)")
     _flight_cache[ident] = (time.time(), res)
     return res

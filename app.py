@@ -1,4 +1,5 @@
 """OrganRoute SD - Streamlit UI.  Run:  streamlit run app.py"""
+import os
 from dataclasses import asdict
 from datetime import datetime, timedelta
 
@@ -45,8 +46,7 @@ def plan_card(plan: dict, source: str):
     msg = st.text_area("Draft message to team", plan.get("message_draft", ""), height=90, key=f"{key}_msg")
     st.caption(f"Plan source: {core.PROVIDER_LABELS.get(source, 'rule-based fallback')}")
     if notify.enabled():
-        n = len(notify.recipients())
-        if st.button(f"📲 Send to team ({notify.channel()}, {n} recipient{'s' * (n != 1)})", key=f"{key}_send"):
+        if st.button(f"📲 Send to team ({notify.describe()})", key=f"{key}_send"):
             title = f"OrganRoute {plan.get('status', '').upper()}: {plan.get('recommendation', '')}"[:120]
             with st.spinner("Sending..."):
                 ok, note = notify.send_alert(title, msg, plan.get("status", "yellow"))
@@ -72,7 +72,7 @@ with st.sidebar:
     organ = st.selectbox("Organ", list(core.VIABILITY_HOURS), index=0)
     origin = st.selectbox("Donor location (nearest airport)", list(core.AIRPORTS), index=list(core.AIRPORTS).index("PHX"))
     hospital = st.selectbox("Receiving hospital", list(core.HOSPITALS))
-    now = datetime.now().replace(second=0, microsecond=0)
+    now = core.sd_now()
     d = st.date_input("Cross-clamp date", now.date())
     t = st.time_input("Cross-clamp time (San Diego time)", (now + timedelta(hours=1)).time())
     crossclamp = datetime.combine(d, t)
@@ -168,8 +168,20 @@ def run_replan(chosen, delay, cause, departed, alert_time, source):
            "alert_source": source, "replan": rp}
     with st.spinner("Re-planning..."):
         st.session_state["rp"] = (rp, core.llm_plan(ctx))
-    st.session_state["rp_source"] = f"{source} at {datetime.now().strftime('%I:%M %p')}"
+    st.session_state["rp_source"] = f"{source} at {core.sd_now().strftime('%I:%M %p')}"
+    st.session_state.pop("text_result", None)
+    auto_text(st.session_state["rp"][1][0])
     return st.session_state["rp"]
+
+
+def auto_text(plan: dict):
+    """Text the team about a new re-plan (live or simulated) if the toggle is on and Twilio is set up."""
+    if notify is None or not notify.enabled() or not st.session_state.get("auto_notify", True):
+        return
+    ok, note = notify.send_alert(f"OrganRoute {plan.get('status', '').upper()}: {plan.get('recommendation', '')}"[:120],
+                                 plan.get("message_draft", ""), plan.get("status", "yellow"))
+    st.session_state["rp_source"] += f" · team {'alerted' if ok else 'NOT alerted'}"
+    st.session_state["text_result"] = (ok, note)
 
 
 @st.fragment(run_every=60)
@@ -201,17 +213,12 @@ def live_panel(chosen, ident):
             elif fs["delay_min"] >= delay:
                 delay, cause, source = fs["delay_min"], f"{fs['ident']} airline-reported delay", "FlightAware flight status"
         st.caption(fs["note"])
-    st.caption(f"Checked {datetime.now().strftime('%I:%M:%S %p')} · refreshes every 60 s")
+    st.caption(f"Checked {core.sd_now().strftime('%I:%M %p')} · refreshes every 60 s")
 
     key = f"{chosen.label}|{delay // 15}|{cause[:40]}"
     if delay >= LIVE_TRIGGER_MIN and key != st.session_state.get("last_live_key"):
         st.session_state["last_live_key"] = key
-        _, plan = run_replan(chosen, delay, cause, departed, datetime.now().replace(second=0, microsecond=0), source)
-        if notify is not None and notify.enabled() and st.session_state.get("auto_notify", True):
-            p = plan[0]
-            ok, note = notify.send_alert(f"OrganRoute {p.get('status', '').upper()}: {p.get('recommendation', '')}"[:120],
-                                         p.get("message_draft", ""), p.get("status", "yellow"))
-            st.session_state["rp_source"] += f" · team {'texted' if ok else 'NOT texted'} ({note[:80]})"
+        run_replan(chosen, delay, cause, departed, core.sd_now(), source)
         st.rerun()  # full rerun so the re-plan shows below
 
 
@@ -236,6 +243,12 @@ with tab2:
         departed = c3.radio("Status", en_route) == en_route[1]
         if chosen.mode == "Charter":
             st.caption("There's no public charter delay history, so you set the delay; the app recomputes the margin and backups.")
+        if notify is not None:
+            if notify.enabled():
+                st.toggle(f"📲 Alert the team automatically on delay alerts, live or simulated ({notify.describe()})",
+                          value=True, key="auto_notify")
+            else:
+                st.caption(f"📲 Team alerts are off: {notify.setup_hint()}, then restart the app.")
         if st.button("🚨 Simulate delay alert", type="primary"):
             alert_time = booked_departure(chosen) - timedelta(minutes=30)  # alert ~30 min before departure
             run_replan(chosen, delay, cause, departed, alert_time, "simulated")
@@ -260,11 +273,6 @@ with tab2:
                 st.session_state["watching"] = not watching
                 st.session_state.pop("last_live_key", None)
                 st.rerun()
-            if notify is not None:
-                if notify.enabled():
-                    st.toggle("Text the team automatically on live alerts", value=True, key="auto_notify")
-                else:
-                    st.caption("Add Twilio settings to .env to text the team automatically on live alerts.")
             if st.session_state.get("watching"):
                 live_panel(chosen, ident)
 
@@ -272,6 +280,9 @@ with tab2:
             rp, plan = st.session_state["rp"]
             if st.session_state.get("rp_source"):
                 st.caption(f"Re-plan triggered by: {st.session_state['rp_source']}")
+            if st.session_state.get("text_result"):
+                ok, note = st.session_state["text_result"]
+                (st.success if ok else st.error)(f"📲 {note}")
             c1, c2, c3 = st.columns(3)
             c1.metric("New hospital ETA", rp["current_flight_new_arrival"])
             c2.metric("Deadline", rp["deadline"])
