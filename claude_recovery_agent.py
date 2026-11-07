@@ -13,6 +13,22 @@ from pathlib import Path
 
 from recovery_agent import RecoveryAgent
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).with_name(".env"))
+except ImportError:
+    # The demo can read its simple local key file before optional dependencies
+    # are installed. Shell variables always take precedence.
+    local_env = Path(__file__).with_name(".env")
+    if local_env.exists():
+        for line in local_env.read_text(encoding="utf-8").splitlines():
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            name, value = line.split("=", 1)
+            name = name.strip()
+            if name in {"ANTHROPIC_API_KEY", "RECOVERY_CLAUDE_MODEL", "AI_PROVIDER"}:
+                os.environ.setdefault(name, value.strip().strip('"').strip("'"))
+
 
 SYSTEM = """You are OrganRoute's transport recovery investigation agent.
 Use tools to inspect the mission and candidate routes before submitting an assessment.
@@ -159,8 +175,7 @@ class ClaudeRecoveryAgent:
         for turn in range(self.max_turns):
             response = client.messages.create(
                 model=self.model, max_tokens=1600, system=SYSTEM, tools=TOOLS,
-                tool_choice=({"type": "tool", "name": "get_mission_state"}
-                             if turn == 0 else {"type": "auto"}), messages=messages)
+                tool_choice={"type": "auto"}, messages=messages)
             if response.stop_reason != "tool_use":
                 raise RuntimeError(f"Claude stopped before submitting an assessment: {response.stop_reason}")
             blocks = [_block_dict(block) for block in response.content]

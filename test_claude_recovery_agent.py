@@ -67,7 +67,7 @@ class ClaudeAgentTests(unittest.TestCase):
                               if c["candidate_id"] == cid)["estimated_delivery"])
         self.assertTrue(assessment["human_approval_required"])
         self.assertFalse(assessment["booking_executed"])
-        self.assertEqual(fake.messages.calls[0]["tool_choice"]["name"], "get_mission_state")
+        self.assertEqual(fake.messages.calls[0]["tool_choice"]["type"], "auto")
         self.assertEqual(fake.messages.calls[1]["messages"][-1]["content"][0]["type"], "tool_result")
         self.assertEqual(agent.analyze("M1"), assessment)
         self.assertEqual(len(fake.messages.calls), 4)
