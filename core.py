@@ -95,10 +95,22 @@ COLS = ["Reporting_Airline", "Origin", "Dest", "CRSDepTime", "CRSElapsedTime",
         "ArrDelay", "Cancelled", "DayOfWeek", "Month"]
 
 
+# data/build_san_dataset.py (san-dataset branch) writes snake_case columns; map them to BTS names
+SAN_DATASET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "san_dataset_out", "flights_into_SAN.csv")
+SNAKE_TO_BTS = {"carrier": "Reporting_Airline", "origin": "Origin", "dest": "Dest", "crs_dep_time": "CRSDepTime",
+                "crs_elapsed_min": "CRSElapsedTime", "arr_delay_min": "ArrDelay", "cancelled": "Cancelled",
+                "day_of_week": "DayOfWeek", "month": "Month"}
+
+
 def load_flights(path: str = "flights_san.csv") -> tuple[pd.DataFrame, bool]:
-    """Returns (df, is_real). Falls back to synthetic data so the app always runs."""
+    """Returns (df, is_real). Uses `path` (BTS columns, from data_prep.py), else the san-dataset output,
+    else synthetic data so the app always runs."""
+    if not os.path.exists(path) and os.path.exists(SAN_DATASET):
+        path = SAN_DATASET
     if os.path.exists(path):
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, low_memory=False).rename(columns=SNAKE_TO_BTS)
+        if "Dest" in df.columns:
+            df = df[df["Dest"] == "SAN"]  # the dataset can include hub arrivals
         df = df[[c for c in COLS if c in df.columns]].dropna(subset=["CRSDepTime", "CRSElapsedTime"])
         df["ArrDelay"] = df["ArrDelay"].fillna(0)
         df["Cancelled"] = df["Cancelled"].fillna(0)
@@ -203,12 +215,34 @@ def _fmt(t: datetime) -> str:
     return t.strftime("%a %I:%M %p")
 
 
+MIN_TIMES_FLOWN = 10       # a departure time must recur this often in the history to count as scheduled
+SLOT_MERGE_MIN = 15        # same-airline departures this close are one flight whose time shifted
+
+
+def _schedule(df: pd.DataFrame, origin: str) -> pd.DataFrame:
+    """Recurring (airline, departure time) slots from history, without one-offs and near-duplicates."""
+    s = (df[df.Origin == origin].groupby(["Reporting_Airline", "CRSDepTime"], as_index=False)
+         .agg(CRSElapsedTime=("CRSElapsedTime", "median"), n=("CRSElapsedTime", "size")))
+    s = s[s.n >= MIN_TIMES_FLOWN]
+    keep = []
+    for _, g in s.groupby("Reporting_Airline"):
+        g = g.assign(mins=g.CRSDepTime.astype(int) // 100 * 60 + g.CRSDepTime.astype(int) % 100).sort_values("mins")
+        cluster = []
+        for _, r in g.iterrows():
+            if cluster and r.mins - cluster[-1].mins > SLOT_MERGE_MIN:
+                keep.append(max(cluster, key=lambda x: x.n))
+                cluster = []
+            cluster.append(r)
+        if cluster:
+            keep.append(max(cluster, key=lambda x: x.n))
+    return pd.DataFrame(keep, columns=s.columns) if keep else s.iloc[0:0]
+
+
 def commercial_options(df, origin, hospital, ready_at_airport: datetime, dl: datetime,
                        n: int = 4, known_delay_min: float = 0) -> list[Option]:
     """Next scheduled flights origin->SAN departing after ready_at_airport (SD time)."""
     offset_h = AIRPORTS[origin][2]
-    sched = (df[df.Origin == origin]
-             .groupby(["Reporting_Airline", "CRSDepTime"], as_index=False)["CRSElapsedTime"].median())
+    sched = _schedule(df, origin)
     to_hosp = HOSPITALS[hospital][0]
     out = []
     for day in (0, 1):
