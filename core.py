@@ -81,6 +81,23 @@ CARRIER_NAMES = {"AA": "American", "AS": "Alaska", "DL": "Delta", "UA": "United"
                  "HA": "Hawaiian", "OO": "SkyWest", "G4": "Allegiant"}
 
 
+def recovery_reference(organ: str, airport_codes: set[str], hospital: str | None = None) -> dict:
+    """Expose legacy assumptions to the recovery agent without generating schedules.
+
+    These constants are background context. The recovery mission's user-specified
+    deadline remains authoritative, and historical delay data is not a live feed.
+    """
+    return {
+        "organ_window_reference_hours": VIABILITY_HOURS.get(organ),
+        "recipient_buffer_reference_hours": RECIPIENT_BUFFER_H,
+        "airport_coordinates": {code: AIRPORTS[code][:2] for code in airport_codes
+                                if code in AIRPORTS},
+        "san_to_hospital_ground_minutes_reference": HOSPITALS[hospital][0]
+        if hospital in HOSPITALS else None,
+        "delay_estimator": "p_on_time: historical BTS or synthetic data; not live flight status",
+    }
+
+
 def haversine_miles(a, b) -> float:
     lat1, lon1, lat2, lon2 = map(math.radians, (a[0], a[1], b[0], b[1]))
     d = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2

@@ -638,6 +638,7 @@ def predict_risk(
     slack_minutes=60,
     model_path=MODEL_PATH,
     dest="SAN",
+    loaded_bundle=None,
 ):
     """
     Predict flight outcomes using calibrated models.
@@ -676,6 +677,7 @@ def predict_risk(
         )
 
     # Load model with compatibility fix.
+    bundle = loaded_bundle if loaded_bundle is not None else _load_model(model_path)
     bundle = _load_model(model_path)
 
     X = _make_features(

@@ -1,12 +1,19 @@
 """OrganRoute SD - Streamlit UI.  Run:  streamlit run app.py"""
 import os
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
 
 import core
+from claude_recovery_agent import ClaudeRecoveryAgent
+from recovery import DisruptionEvent, EventType, TransportStage
+from recovery_agent import EventEnvelope, RecoveryAgent
+from recovery_demo import demo_mission
 import live
 import notify
 
@@ -93,7 +100,8 @@ MODE_NOTES = {
     "Ground": "Showing ground courier only (within ~400 road miles). Travel time is a distance-based estimate.",
 }
 
-tab1, tab2 = st.tabs(["1 · Plan transport", "2 · Delay alert → re-plan"])
+tab1, tab2, tab3 = st.tabs(["1 · Plan transport", "2 · Delay alert → re-plan",
+                           "3 · Recovery agent demo"])
 
 # ---------------- Tab 1: Planning ----------------
 with tab1:
@@ -291,3 +299,166 @@ with tab2:
             if rp["backups"]:
                 st.subheader("Backup options")
                 options_table(rp["backups"])
+
+
+# ---------------- Tab 3: deterministic, stateful recovery agent simulation ----------------
+with tab3:
+    st.subheader("Recovery agent · simulation")
+    st.warning("All flights, airport transfers, and ground durations in this tab are hypothetical. "
+               "Nothing here is a live schedule, carrier acceptance, or booking.")
+    agent = RecoveryAgent(Path(__file__).with_name("recovery_demo.sqlite3"))
+
+    def run_claude_recovery(mission_id: str):
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            return
+        try:
+            with st.spinner("Claude is investigating recovery options with tools..."):
+                ClaudeRecoveryAgent(agent).analyze(mission_id)
+        except Exception as exc:
+            st.error(f"Claude assessment failed: {exc}")
+
+    with st.form("new_recovery_mission"):
+        demo_organ = st.selectbox("Organ for simulated mission", list(core.VIABILITY_HOURS),
+                                  key="demo_organ")
+        demo_hospital = st.selectbox("Receiving hospital", list(core.HOSPITALS),
+                                     key="demo_hospital")
+        deadline_hours = st.number_input("User-specified deadline: hours from mission start",
+                                         min_value=1, max_value=48, value=6)
+        demo_risk_threshold = st.number_input("Demo flight risk flag threshold (%)",
+                                              min_value=0, max_value=100, value=25)
+        create_demo = st.form_submit_button("Create simulated PHX → San Diego mission")
+    if create_demo:
+        started = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        mission_id = f"demo-{uuid4().hex[:12]}"
+        agent = RecoveryAgent(Path(__file__).with_name("recovery_demo.sqlite3"),
+                              risk_flag_threshold=demo_risk_threshold / 100)
+        agent.create_mission(demo_mission(mission_id, started,
+                                          started + timedelta(hours=int(deadline_hours)), demo_organ,
+                                          demo_hospital, core.HOSPITALS[demo_hospital][0]))
+        st.session_state["recovery_mission_id"] = mission_id
+
+    mission_id = st.session_state.get("recovery_mission_id")
+    if mission_id:
+        mission = agent.get_mission(mission_id)
+        initial = agent.initial_assessment(mission_id) or {
+            "flight_id": mission.current_flight.flight_id if mission.current_flight else None,
+            "scheduled_delivery_eta": None, "deadline_margin_minutes": None,
+            "flight_disruption_risk": {"probability": None, "source": "legacy_mission_no_initial_assessment"},
+            "elevated_flight_risk_demo_flag": False, "risk_flag_threshold": agent.risk_flag_threshold}
+        st.write("**Before disruption: scheduled plan (simulated flight)**")
+        st.write({"Flight": initial["flight_id"],
+                  "Scheduled delivery ETA": initial["scheduled_delivery_eta"],
+                  "Deadline margin (min)": initial["deadline_margin_minutes"],
+                  "Historical flight prediction target": initial["flight_disruption_risk"].get("prediction_type") or "Unknown",
+                  "Historical flight probability": initial["flight_disruption_risk"]["probability"]})
+        if initial["elevated_flight_risk_demo_flag"]:
+            st.info(f"Demo flight risk flag: probability meets the configurable {initial['risk_flag_threshold']:.0%} threshold. Verify options before acting.")
+        with st.expander("Initial model coverage and warnings"):
+            st.json(initial["flight_disruption_risk"])
+        if agent.latest_report(mission_id) is None and st.button("Prepare recovery alternatives now"):
+            try:
+                prepared_at = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+                agent.handle_event(EventEnvelope(mission_id, uuid4().hex,
+                    DisruptionEvent(EventType.ETA_UPDATED, prepared_at,
+                                    updated_eta=mission.current_expected_arrival)))
+            except ValueError as exc:
+                st.error(str(exc))
+        st.caption(f"Mission {mission_id} · Stage: {mission.stage.value} · "
+                   f"Deadline: {mission.deadline.isoformat()}")
+        if mission.stage == TransportStage.ORIGIN and st.button("Simulate organ boarded current flight"):
+            agent.set_stage(mission_id, TransportStage.ONBOARD, "ONBOARD_DEMO_CURRENT")
+            run_claude_recovery(mission_id)
+            mission = agent.get_mission(mission_id)
+        if mission.stage == TransportStage.ONBOARD and mission.diverted_to and st.button(
+                "Simulate landing at diversion airport"):
+            agent.set_stage(mission_id, TransportStage.TRANSFER, mission.diverted_to)
+            run_claude_recovery(mission_id)
+            mission = agent.get_mission(mission_id)
+
+        with st.form("recovery_event"):
+            event_type = st.selectbox("Simulated disruption", [e for e in EventType
+                                      if e != EventType.STAGE_UPDATED],
+                                      format_func=lambda e: e.value)
+            delay_minutes = st.number_input("Delay / ETA change (minutes)",
+                                            min_value=0, max_value=480, value=60)
+            diversion_airport = st.selectbox("Diversion airport", ["LAX", "AZA"])
+            submit_event = st.form_submit_button("Apply event and re-plan")
+        if submit_event:
+            occurred = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+            try:
+                if event_type == EventType.FLIGHT_DELAYED:
+                    event = DisruptionEvent(event_type, occurred, delay_minutes=int(delay_minutes))
+                elif event_type == EventType.ETA_UPDATED:
+                    eta = occurred + timedelta(minutes=int(delay_minutes))
+                    event = DisruptionEvent(event_type, occurred, updated_eta=eta)
+                elif event_type == EventType.FLIGHT_DIVERTED:
+                    event = DisruptionEvent(event_type, occurred,
+                                            updated_eta=occurred + timedelta(minutes=90),
+                                            diversion_airport=diversion_airport)
+                else:
+                    event = DisruptionEvent(event_type, occurred)
+                agent.handle_event(EventEnvelope(mission_id, uuid4().hex, event))
+                run_claude_recovery(mission_id)
+            except ValueError as exc:
+                st.error(str(exc))
+
+        st.button("Refresh recovery report")
+        report = agent.latest_report(mission_id)
+        if report:
+            st.write("Observed simulation event", report["event"])
+            st.write("Updated current-flight ETA",
+                     report["updated_mission_status"]["current_expected_arrival"] or "Unavailable")
+            st.caption(f"Plan version {report['mission_version']} · Source: {report['data_source']} · "
+                       "Human approval required")
+            airports = report["departure_airports_considered"]
+            st.write("**Departure airports examined:** " +
+                     (", ".join(f"{a['airport']} ({a['transfer_minutes']} min transfer)" for a in airports)
+                      if airports else "None reachable from the current stage"))
+            candidates = [report["original_plan_assessment"], *report["alternative_plans"]]
+            summary = pd.DataFrame([{
+                "Rank": c["rank"], "Strategy": c["strategy"],
+                "Flight": c["flight"]["flight_id"] if c["flight"] else "—",
+                "Delivery ETA": c["estimated_delivery"] or "Unknown",
+                "Margin (min)": c["feasibility"]["deadline_margin_minutes"],
+                "Feasibility": c["feasibility"]["status"],
+                "Unverified steps": len(c["feasibility"]["verification_requirements"]),
+                "Historical P(flight cancelled, diverted, or >60 min late)": (f"{c['flight_disruption_risk']['probability']:.1%}"
+                                if c["flight_disruption_risk"]["probability"] is not None
+                                else "Unknown / " + c["flight_disruption_risk"]["source"]),
+            } for c in sorted(candidates, key=lambda c: c["rank"])])
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.caption(report.get("ranking_basis", "Review deadline, verification requirements, and unknown risk before acting."))
+            for candidate in sorted(candidates, key=lambda c: c["rank"]):
+                with st.expander(f"#{candidate['rank']} {candidate['strategy']} · "
+                                 f"{candidate['feasibility']['status']}"):
+                    st.write("Timeline", candidate["timeline"])
+                    st.write("Historical flight risk and model coverage", candidate["flight_disruption_risk"])
+                    st.write("Verification required", candidate["feasibility"]["verification_requirements"])
+                    if candidate["feasibility"]["reasons"]:
+                        st.write("Infeasibility reasons", candidate["feasibility"]["reasons"])
+            eligible = report["ranked_recommendation_candidates"]
+            if eligible:
+                review_id = st.selectbox("Candidate for human review",
+                                         [c["candidate_id"] for c in eligible],
+                                         key=f"review-{mission_id}-{report['mission_version']}")
+                if st.button("Record review (no booking)"):
+                    agent.review_candidate(mission_id, report["mission_version"], review_id)
+                    st.success("Review recorded. Transport and handoffs still need confirmation.")
+            with st.expander("Agent tool trace"):
+                st.json(report["agent_trace"])
+            if not os.getenv("ANTHROPIC_API_KEY"):
+                st.info("Claude recovery agent is not configured. Set ANTHROPIC_API_KEY, "
+                        "then run a new event or click below.")
+            if st.button("Run Claude tool agent for this plan"):
+                run_claude_recovery(mission_id)
+            assessment = agent.get_ai_assessment(mission_id, report["mission_version"])
+            if assessment:
+                st.subheader("Claude tool agent assessment")
+                st.caption(f"Model: {assessment['model']} · Plan version: {assessment['plan_version']} · "
+                           "Human approval required")
+                st.write(assessment["agent_reasoning"])
+                st.write("Selected computed candidates", assessment["selected_options"])
+                st.write("Questions to verify", assessment["verification_questions"])
+                with st.expander("Claude tool calls"):
+                    st.json(assessment["tool_trace"])
+            st.caption(report["uncertainty"])
