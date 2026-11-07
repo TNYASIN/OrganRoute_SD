@@ -20,6 +20,12 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
+try:  # load API keys / AI_PROVIDER from a local .env file if present
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # Constants / assumptions (state these in the demo!)
 # ---------------------------------------------------------------------------
@@ -390,7 +396,9 @@ def llm_plan(context: dict) -> tuple[dict, str]:
         return fb, "fallback"
     default_model, key_vars = PROVIDERS[provider]
     if not any(os.environ.get(k) for k in key_vars):
-        return rule_plan(context), "fallback"
+        fb = rule_plan(context)
+        fb["reasoning"] += f" (No {' / '.join(key_vars)} found; check .env and that python-dotenv is installed. Rule fallback.)"
+        return fb, "fallback"
     try:
         model = os.environ.get("AI_MODEL", default_model)
         return _CALLERS[provider](context, model), provider
