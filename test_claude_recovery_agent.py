@@ -1,5 +1,6 @@
 """Tool-loop tests with a fake Claude client; no API key or network required."""
 
+import json
 import tempfile
 import unittest
 from copy import deepcopy
@@ -69,6 +70,11 @@ class ClaudeAgentTests(unittest.TestCase):
         self.assertFalse(assessment["booking_executed"])
         self.assertEqual(fake.messages.calls[0]["tool_choice"]["type"], "auto")
         self.assertEqual(fake.messages.calls[1]["messages"][-1]["content"][0]["type"], "tool_result")
+        listed = json.loads(fake.messages.calls[2]["messages"][-1]["content"][0]["content"])
+        modeled = next(c for c in listed["all_candidates"]
+                       if c["flight_disruption_risk"]["source"] == "trained_flight_model")
+        self.assertEqual(modeled["flight_disruption_risk"]["model_version"], 4)
+        self.assertEqual(modeled["flight_disruption_risk"]["prediction_threshold_minutes"], 60)
         self.assertEqual(agent.analyze("M1"), assessment)
         self.assertEqual(len(fake.messages.calls), 4)
 

@@ -175,10 +175,14 @@ with tab3:
                                      key="demo_hospital")
         deadline_hours = st.number_input("User-specified deadline: hours from mission start",
                                          min_value=1, max_value=48, value=6)
+        demo_risk_threshold = st.number_input("Demo flight risk flag threshold (%)",
+                                              min_value=0, max_value=100, value=25)
         create_demo = st.form_submit_button("Create simulated PHX → San Diego mission")
     if create_demo:
         started = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         mission_id = f"demo-{uuid4().hex[:12]}"
+        agent = RecoveryAgent(Path(__file__).with_name("recovery_demo.sqlite3"),
+                              risk_flag_threshold=demo_risk_threshold / 100)
         agent.create_mission(demo_mission(mission_id, started,
                                           started + timedelta(hours=int(deadline_hours)), demo_organ,
                                           demo_hospital, core.HOSPITALS[demo_hospital][0]))
@@ -187,6 +191,29 @@ with tab3:
     mission_id = st.session_state.get("recovery_mission_id")
     if mission_id:
         mission = agent.get_mission(mission_id)
+        initial = agent.initial_assessment(mission_id) or {
+            "flight_id": mission.current_flight.flight_id if mission.current_flight else None,
+            "scheduled_delivery_eta": None, "deadline_margin_minutes": None,
+            "flight_disruption_risk": {"probability": None, "source": "legacy_mission_no_initial_assessment"},
+            "elevated_flight_risk_demo_flag": False, "risk_flag_threshold": agent.risk_flag_threshold}
+        st.write("**Before disruption: scheduled plan (simulated flight)**")
+        st.write({"Flight": initial["flight_id"],
+                  "Scheduled delivery ETA": initial["scheduled_delivery_eta"],
+                  "Deadline margin (min)": initial["deadline_margin_minutes"],
+                  "Historical flight prediction target": initial["flight_disruption_risk"].get("prediction_type") or "Unknown",
+                  "Historical flight probability": initial["flight_disruption_risk"]["probability"]})
+        if initial["elevated_flight_risk_demo_flag"]:
+            st.info(f"Demo flight risk flag: probability meets the configurable {initial['risk_flag_threshold']:.0%} threshold. Verify options before acting.")
+        with st.expander("Initial model coverage and warnings"):
+            st.json(initial["flight_disruption_risk"])
+        if agent.latest_report(mission_id) is None and st.button("Prepare recovery alternatives now"):
+            try:
+                prepared_at = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+                agent.handle_event(EventEnvelope(mission_id, uuid4().hex,
+                    DisruptionEvent(EventType.ETA_UPDATED, prepared_at,
+                                    updated_eta=mission.current_expected_arrival)))
+            except ValueError as exc:
+                st.error(str(exc))
         st.caption(f"Mission {mission_id} · Stage: {mission.stage.value} · "
                    f"Deadline: {mission.deadline.isoformat()}")
         if mission.stage == TransportStage.ORIGIN and st.button("Simulate organ boarded current flight"):
@@ -229,6 +256,9 @@ with tab3:
         st.button("Refresh recovery report")
         report = agent.latest_report(mission_id)
         if report:
+            st.write("Observed simulation event", report["event"])
+            st.write("Updated current-flight ETA",
+                     report["updated_mission_status"]["current_expected_arrival"] or "Unavailable")
             st.caption(f"Plan version {report['mission_version']} · Source: {report['data_source']} · "
                        "Human approval required")
             airports = report["departure_airports_considered"]
@@ -243,15 +273,17 @@ with tab3:
                 "Margin (min)": c["feasibility"]["deadline_margin_minutes"],
                 "Feasibility": c["feasibility"]["status"],
                 "Unverified steps": len(c["feasibility"]["verification_requirements"]),
-                "Flight risk": (c["flight_disruption_risk"]["probability"]
+                "Historical P(flight cancelled, diverted, or >60 min late)": (f"{c['flight_disruption_risk']['probability']:.1%}"
                                 if c["flight_disruption_risk"]["probability"] is not None
-                                else c["flight_disruption_risk"]["source"]),
+                                else "Unknown / " + c["flight_disruption_risk"]["source"]),
             } for c in sorted(candidates, key=lambda c: c["rank"])])
             st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.caption(report.get("ranking_basis", "Review deadline, verification requirements, and unknown risk before acting."))
             for candidate in sorted(candidates, key=lambda c: c["rank"]):
                 with st.expander(f"#{candidate['rank']} {candidate['strategy']} · "
                                  f"{candidate['feasibility']['status']}"):
                     st.write("Timeline", candidate["timeline"])
+                    st.write("Historical flight risk and model coverage", candidate["flight_disruption_risk"])
                     st.write("Verification required", candidate["feasibility"]["verification_requirements"])
                     if candidate["feasibility"]["reasons"]:
                         st.write("Infeasibility reasons", candidate["feasibility"]["reasons"])

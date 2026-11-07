@@ -7,7 +7,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Protocol
@@ -16,6 +16,7 @@ from uuid import uuid4
 from recovery import (DisruptionEvent, EventType, Flight, FlightRiskPredictor, MissionState,
                       TransportCatalog, TransportStage, process_disruption)
 from recovery_demo import demo_catalog
+from flight_model_adapter import FlightModelAdapter, RISK_THRESHOLD
 
 
 class EventSource(Protocol):
@@ -106,10 +107,15 @@ class RecoveryAgent:
     def __init__(self, database: str | Path,
                  catalog_provider: Callable[[MissionState, datetime], TransportCatalog] = demo_catalog,
                  flight_risk_predictor: FlightRiskPredictor | None = None,
-                 provider_configured: bool = False):
+                 provider_configured: bool = False,
+                 risk_flag_threshold: float = RISK_THRESHOLD):
         self.database = str(database)
         self.catalog_provider = catalog_provider
-        self.flight_risk_predictor = flight_risk_predictor
+        self.flight_risk_predictor = (flight_risk_predictor if flight_risk_predictor is not None
+                                      else FlightModelAdapter())
+        if not 0 <= risk_flag_threshold <= 1:
+            raise ValueError("risk_flag_threshold must be between 0 and 1")
+        self.risk_flag_threshold = risk_flag_threshold
         self.provider_configured = provider_configured
         with self._connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS missions (
@@ -127,6 +133,8 @@ class RecoveryAgent:
                 mission_id TEXT NOT NULL, plan_version INTEGER NOT NULL,
                 assessment_json TEXT NOT NULL,
                 PRIMARY KEY (mission_id, plan_version))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS initial_assessments (
+                mission_id TEXT PRIMARY KEY, assessment_json TEXT NOT NULL)""")
 
     @contextmanager
     def _connect(self):
@@ -144,9 +152,36 @@ class RecoveryAgent:
     def create_mission(self, state: MissionState) -> None:
         if not state.simulation_mode:
             raise ValueError("this agent currently accepts simulation missions only")
+        from recovery import predict_flight_disruption
+        eta = (state.current_expected_arrival +
+               timedelta(minutes=state.handling_minutes + state.ground_transfer_minutes)
+               if state.current_expected_arrival is not None else None)
+        margin = int((state.deadline - eta).total_seconds() // 60) if eta else None
+        risk = (predict_flight_disruption(state.current_flight, self.flight_risk_predictor)
+                if state.current_flight and state.stage != TransportStage.ONBOARD else
+                {"probability": None, "source": "not_applicable_or_missing_flight",
+                 "scope": "commercial_flight_disruption"})
+        assessment = {"mission_id": state.mission_id,
+                      "flight_id": state.current_flight.flight_id if state.current_flight else None,
+                      "scheduled_delivery_eta": eta.isoformat() if eta else None,
+                      "deadline_margin_minutes": margin,
+                      "flight_disruption_risk": risk,
+                      "risk_flag_threshold": self.risk_flag_threshold,
+                      "elevated_flight_risk_demo_flag": (risk["probability"] is not None and
+                                                         risk["probability"] >= self.risk_flag_threshold),
+                      "human_approval_required": True,
+                      "note": "Scheduled ETA uses mission handling estimates; flight risk is historical and does not predict delivery or medical viability."}
         with self._connect() as db:
             db.execute("INSERT INTO missions VALUES (?, ?, 0, NULL)",
                        (state.mission_id, json.dumps(asdict(state), default=_json_default)))
+            db.execute("INSERT INTO initial_assessments VALUES (?, ?)",
+                       (state.mission_id, json.dumps(assessment)))
+
+    def initial_assessment(self, mission_id: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute("SELECT assessment_json FROM initial_assessments WHERE mission_id=?",
+                             (mission_id,)).fetchone()
+        return json.loads(row["assessment_json"]) if row else None
 
     def get_mission(self, mission_id: str) -> MissionState:
         with self._connect() as db:

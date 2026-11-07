@@ -148,7 +148,7 @@ class MissionState:
             raise ValueError("onboard mission requires a current flight")
 
 
-FlightRiskPredictor = Callable[[Flight], float | None]
+FlightRiskPredictor = Callable[[Flight], float | dict | None]
 
 
 def calculate_remaining_time(state: MissionState, at: datetime) -> int:
@@ -167,6 +167,11 @@ def predict_flight_disruption(flight: Flight, predictor: FlightRiskPredictor | N
                 "scope": "commercial_flight_disruption"}
     if probability is None:
         return {"probability": None, "source": "unavailable", "scope": "commercial_flight_disruption"}
+    if isinstance(probability, dict):
+        value = probability.get("probability")
+        if value is not None and not 0 <= value <= 1:
+            raise ValueError("flight risk predictor must return a probability in [0, 1]")
+        return probability
     if not 0 <= probability <= 1:
         raise ValueError("flight risk predictor must return a probability in [0, 1]")
     return {"probability": float(probability), "source": "injected_flight_model", "scope": "commercial_flight_disruption"}
@@ -359,15 +364,15 @@ def evaluate_route_feasibility(state: MissionState, event: DisruptionEvent, rout
 
 
 def rank_recovery_options(options: list[dict]) -> list[dict]:
-    """Hard feasibility first, then verified logistics, margin, flight risk and handoffs."""
+    """Feasibility first; compare known flight risk without treating unknown as zero."""
     def key(option: dict) -> tuple:
         risk = option["flight_disruption_risk"]["probability"]
         margin = option["feasibility"]["deadline_margin_minutes"]
         return (option["feasibility"]["status"] == "INFEASIBLE",
                 len(option["feasibility"]["verification_requirements"]),
-                -(margin if margin is not None else -10**9),
                 risk is None and option["flight"] is not None,
-                risk if risk is not None else 0,
+                risk if risk is not None else 1,
+                -(margin if margin is not None else -10**9),
                 option["handoff_count"])
     ranked = sorted(options, key=key)
     for index, option in enumerate(ranked, 1):
@@ -441,8 +446,15 @@ def process_disruption(state: MissionState, event: DisruptionEvent,
         estimate = estimate_route_arrival(state, event, route)
         feasibility = evaluate_route_feasibility(state, event, route, estimate)
         flight = route["flight"]
-        risk = predict_flight_disruption(flight, flight_risk_predictor) if flight else {
-            "probability": None, "source": "not_applicable", "scope": "commercial_flight_disruption"}
+        if flight is None:
+            risk = {"probability": None, "source": "not_applicable",
+                    "scope": "commercial_flight_disruption"}
+        elif route["strategy"] == "CONTINUE_CURRENT_FLIGHT":
+            risk = {"probability": None, "source": "observed_event_not_modelled",
+                    "scope": "commercial_flight_disruption",
+                    "warnings": ["The pre-departure model does not condition on the observed flight event."]}
+        else:
+            risk = predict_flight_disruption(flight, flight_risk_predictor)
         options.append({"candidate_id": f"{state.mission_id}-{len(state.event_history)}-{i}",
                         "strategy": route["strategy"], "flight": ({**asdict(flight),
                             "departure": flight.departure.isoformat(), "arrival": flight.arrival.isoformat(),
@@ -468,6 +480,7 @@ def process_disruption(state: MissionState, event: DisruptionEvent,
                        for o in viable]
     return {"mission_id": state.mission_id, "simulation_mode": True,
             "data_source": catalog.source, "event": state.event_history[-1],
+            "ranking_basis": "Feasibility, unverified logistics count, known commercial flight risk, deadline margin, then handoffs. Unknown flight risk remains unknown; ground transport has no flight-model estimate.",
             "updated_mission_status": {"organ_type": state.organ_type, "origin": state.origin,
                                        "destination": state.destination, "current_location": state.current_location,
                                        "transport_stage": state.stage.value, "deadline": state.deadline.isoformat(),

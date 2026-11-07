@@ -27,16 +27,57 @@ the agent examines transfers to both PHX and AZA instead of asking you to pick
 the nearest airport. The hospital list and SAN ground-time reference come from
 the existing `core.py`; the demo flight and transfer times remain hypothetical.
 It stores mission state and plan versions in
-`recovery_demo.sqlite3` (ignored by Git). It requires no LLM key or extra package.
+`recovery_demo.sqlite3` (ignored by Git). It requires no LLM key; install the
+packages in `requirements.txt` for the trained flight model.
 
 The demo catalog contains invented PHX/AZA/SAN/LAX flight and ground scenarios.
 They are **not current schedules, bookings, road forecasts, or carrier acceptance**.
-The planner marks unconfirmed handoffs and keeps approval with a person. No
-CatBoost artifact or live transport provider is included in this repository;
-flight risk is shown as unavailable unless a trained predictor is supplied.
+The planner marks unconfirmed handoffs and keeps approval with a person. The
+teammate's calibrated scikit-learn artifact is included; no live transport
+provider is configured. Unsupported flights retain unknown risk.
 The **Record review** action stores a human review of the current plan version;
 it does not confirm transport availability, book a carrier, or authorize a
 medical decision.
+
+### Trained flight model integration
+
+`flight_model_adapter.py` maps each future flight to the six exact model
+features: origin, reporting airline, destination, **origin-local** departure
+hour, day of week, and month. It reuses `model.py` preprocessing and calibrated
+prediction logic, loading the trusted local artifact once per process. The
+historical route list is `data/san_dataset_out/san_routes.csv`. Predictions
+are restricted to sufficiently represented carrier-origin routes into SAN;
+other flights show unknown risk. The source data samples January, April, July,
+and October 2025, so other departure months carry an out-of-sample warning.
+The artifact was saved with scikit-learn 1.6.1; `requirements.txt` pins that
+version.
+
+The prediction is the historical probability that a commercial flight is
+cancelled, diverted, or arrives more than **60 minutes** after its scheduled
+arrival. It does not estimate organ delivery, clinical viability, or ground
+transport reliability. A probability is never added to the delivery ETA.
+
+At mission creation, the app shows the initial simulated flight, scheduled
+delivery ETA, deadline margin, exact model target, and a configurable demo risk
+flag (default 25%). **Prepare recovery alternatives now** creates a versioned
+plan. After a disruption, the agent uses the observed event to update the
+current flight ETA and computes each alternative separately. It does not apply
+the pre-departure model to a flight whose delay or cancellation is already
+observed. Claude's tools receive model provenance, coverage, and warnings;
+they cannot change the calculations or invent probabilities. Transport
+schedules remain hypothetical and require human verification.
+
+On Windows PowerShell from this repository directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m unittest discover -v
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Open the local URL printed by Streamlit, select **Recovery agent demo**, create
+a mission, and apply a simulated delay or cancellation. `ANTHROPIC_API_KEY` is
+optional for deterministic planning; setting it enables the Claude assessment.
 
 ### Claude tool agent
 

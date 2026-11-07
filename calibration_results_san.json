@@ -1,0 +1,156 @@
+{
+  "cancelled": {
+    "original": {
+      "brier": 0.00951,
+      "predicted_rate": 0.00913,
+      "actual_rate": 0.00957,
+      "roc_auc": 0.58982
+    },
+    "calibrated": {
+      "brier": 0.00947,
+      "predicted_rate": 0.00935,
+      "actual_rate": 0.00957,
+      "roc_auc": 0.58982
+    }
+  },
+  "diverted": {
+    "original": {
+      "brier": 0.01131,
+      "predicted_rate": 0.03012,
+      "actual_rate": 0.01081,
+      "roc_auc": 0.6394
+    },
+    "calibrated": {
+      "brier": 0.01072,
+      "predicted_rate": 0.00498,
+      "actual_rate": 0.01081,
+      "roc_auc": 0.6394
+    }
+  },
+  "delay_gt_0": {
+    "original": {
+      "brier": 0.23445,
+      "predicted_rate": 0.45319,
+      "actual_rate": 0.49322,
+      "roc_auc": 0.65225
+    },
+    "calibrated": {
+      "brier": 0.2365,
+      "predicted_rate": 0.43078,
+      "actual_rate": 0.49322,
+      "roc_auc": 0.65225
+    }
+  },
+  "delay_gt_15": {
+    "original": {
+      "brier": 0.18751,
+      "predicted_rate": 0.26861,
+      "actual_rate": 0.26833,
+      "roc_auc": 0.65108
+    },
+    "calibrated": {
+      "brier": 0.18711,
+      "predicted_rate": 0.2393,
+      "actual_rate": 0.26833,
+      "roc_auc": 0.65108
+    }
+  },
+  "delay_gt_30": {
+    "original": {
+      "brier": 0.13187,
+      "predicted_rate": 0.17421,
+      "actual_rate": 0.1596,
+      "roc_auc": 0.64954
+    },
+    "calibrated": {
+      "brier": 0.13008,
+      "predicted_rate": 0.14987,
+      "actual_rate": 0.1596,
+      "roc_auc": 0.64954
+    }
+  },
+  "delay_gt_45": {
+    "original": {
+      "brier": 0.09132,
+      "predicted_rate": 0.1234,
+      "actual_rate": 0.10086,
+      "roc_auc": 0.64027
+    },
+    "calibrated": {
+      "brier": 0.08939,
+      "predicted_rate": 0.10179,
+      "actual_rate": 0.10086,
+      "roc_auc": 0.64027
+    }
+  },
+  "delay_gt_60": {
+    "original": {
+      "brier": 0.06378,
+      "predicted_rate": 0.0959,
+      "actual_rate": 0.06603,
+      "roc_auc": 0.64395
+    },
+    "calibrated": {
+      "brier": 0.06141,
+      "predicted_rate": 0.07568,
+      "actual_rate": 0.06603,
+      "roc_auc": 0.64395
+    }
+  },
+  "delay_gt_90": {
+    "original": {
+      "brier": 0.03414,
+      "predicted_rate": 0.05851,
+      "actual_rate": 0.03381,
+      "roc_auc": 0.63338
+    },
+    "calibrated": {
+      "brier": 0.03281,
+      "predicted_rate": 0.04437,
+      "actual_rate": 0.03381,
+      "roc_auc": 0.63338
+    }
+  },
+  "delay_gt_120": {
+    "original": {
+      "brier": 0.02044,
+      "predicted_rate": 0.03691,
+      "actual_rate": 0.02026,
+      "roc_auc": 0.66126
+    },
+    "calibrated": {
+      "brier": 0.01983,
+      "predicted_rate": 0.02654,
+      "actual_rate": 0.02026,
+      "roc_auc": 0.66126
+    }
+  },
+  "delay_gt_180": {
+    "original": {
+      "brier": 0.00941,
+      "predicted_rate": 0.01437,
+      "actual_rate": 0.00947,
+      "roc_auc": 0.68221
+    },
+    "calibrated": {
+      "brier": 0.00936,
+      "predicted_rate": 0.01047,
+      "actual_rate": 0.00947,
+      "roc_auc": 0.68221
+    }
+  },
+  "delay_gt_240": {
+    "original": {
+      "brier": 0.00525,
+      "predicted_rate": 0.00818,
+      "actual_rate": 0.00525,
+      "roc_auc": 0.56584
+    },
+    "calibrated": {
+      "brier": 0.00522,
+      "predicted_rate": 0.00661,
+      "actual_rate": 0.00525,
+      "roc_auc": 0.56584
+    }
+  }
+}

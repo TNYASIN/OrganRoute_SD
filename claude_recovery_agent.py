@@ -37,6 +37,10 @@ Select only existing, non-infeasible candidate IDs. Never invent a flight, route
 carrier acceptance, confirmed availability, or medical deadline. The user-provided
 mission deadline is authoritative. Core reference constants are context only.
 All demo transport data is hypothetical. Preserve unknown risk and unverified steps.
+The trained model estimates historical commercial flight outcomes before departure.
+Read the prediction target, route support, warnings, and sampled-month coverage.
+Do not turn flight probability into delay minutes or organ delivery probability.
+An observed delay or cancellation is an event, not a fresh model prediction.
 If no candidate meets the deadline, submit NO_FEASIBLE_OPTIONS with no IDs.
 Your submit_recovery_assessment tool call must be the sole tool call in its turn.
 Your output is decision support; a human must verify logistics and approve action.
@@ -199,7 +203,11 @@ class ClaudeRecoveryAgent:
                         output = {"recommended_candidates": output,
                                   "all_candidates": [{"candidate_id": c["candidate_id"],
                                                       "strategy": c["strategy"],
-                                                      "status": c["feasibility"]["status"]}
+                                                      "status": c["feasibility"]["status"],
+                                                      "estimated_delivery": c["estimated_delivery"],
+                                                      "deadline_margin_minutes": c["feasibility"]["deadline_margin_minutes"],
+                                                      "flight_disruption_risk": c["flight_disruption_risk"],
+                                                      "verification_requirements": c["feasibility"]["verification_requirements"]}
                                                      for c in self._candidates(report)]}
                     elif name == "inspect_candidate":
                         cid = arguments.get("candidate_id")

@@ -14,7 +14,7 @@ def demo_mission(mission_id: str, now: datetime, deadline: datetime,
     if san_ground_minutes <= 0:
         raise ValueError("destination ground transfer must be positive")
     current = Flight("DEMO-CURRENT", "PHX", "SAN", now + timedelta(minutes=90),
-                     now + timedelta(minutes=170), observed_at=now,
+                     now + timedelta(minutes=170), carrier="WN", observed_at=now,
                      expires_at=now + timedelta(hours=6))
     return MissionState(mission_id, organ_type, DONOR_SITE, destination,
                         DONOR_SITE, TransportStage.ORIGIN, deadline, current,
@@ -30,7 +30,9 @@ def demo_catalog(state: MissionState, at: datetime) -> TransportCatalog:
 
     def flight(fid: str, origin: str, dest: str, depart_min: int, arrive_min: int) -> Flight:
         return Flight(fid, origin, dest, at + timedelta(minutes=depart_min),
-                      at + timedelta(minutes=arrive_min), observed_at=at, expires_at=expires)
+                      at + timedelta(minutes=arrive_min),
+                      carrier="WN" if (origin, dest) == ("PHX", "SAN") else "unverified carrier",
+                      observed_at=at, expires_at=expires)
 
     def ground(origin: str, dest: str, minutes: int) -> GroundOption:
         return GroundOption(origin, dest, minutes, observed_at=at, expires_at=expires)

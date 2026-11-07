@@ -82,7 +82,11 @@ class RecoveryTests(unittest.TestCase):
         report = process_disruption(mission(), DisruptionEvent(EventType.FLIGHT_DELAYED, START,
                                     delay_minutes=30), hypothetical_demo_catalog(START),
                                     flight_risk_predictor=lambda flight: 0.25)
-        self.assertEqual(report["original_plan_assessment"]["flight_disruption_risk"]["probability"], 0.25)
+        self.assertIsNone(report["original_plan_assessment"]["flight_disruption_risk"]["probability"])
+        self.assertEqual(report["original_plan_assessment"]["flight_disruption_risk"]["source"],
+                         "observed_event_not_modelled")
+        alternative = next(p for p in report["alternative_plans"] if p["flight"])
+        self.assertEqual(alternative["flight_disruption_risk"]["probability"], 0.25)
         direct_ground = next(p for p in report["alternative_plans"] if p["strategy"] == "DIRECT_GROUND")
         self.assertEqual(direct_ground["flight_disruption_risk"]["source"], "not_applicable")
 
