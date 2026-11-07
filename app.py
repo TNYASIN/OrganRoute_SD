@@ -6,6 +6,12 @@ import pandas as pd
 import streamlit as st
 
 import core
+import live
+
+try:  # team texts come from the notifications branch; the app works without it
+    import notify
+except ImportError:
+    notify = None
 
 st.set_page_config(page_title="OrganRoute SD", page_icon="🫀", layout="wide")
 COLORS = {"green": "#1e8e3e", "yellow": "#f9ab00", "red": "#d93025"}
@@ -134,6 +140,71 @@ with tab1:
         plan_card(*st.session_state["plan1"])
 
 # ---------------- Tab 2: Re-planning ----------------
+LIVE_TRIGGER_MIN = 15   # live delays below this don't trigger a re-plan
+
+
+def booked_departure(chosen) -> datetime:
+    """The booked option's departure as a datetime on/after the cross-clamp date."""
+    t = datetime.strptime(chosen.depart, "%a %I:%M %p")
+    dep = crossclamp.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+    return dep + timedelta(days=1) if dep < crossclamp - timedelta(hours=1) else dep
+
+
+def run_replan(chosen, delay, cause, departed, alert_time, source):
+    rp = core.replan(df, organ, origin, hospital, crossclamp, chosen, delay, alert_time, departed,
+                     st.session_state.get("charter"))
+    ctx = {"phase": "replan", "organ": organ, "origin": origin, "hospital": hospital,
+           "booked_transport": asdict(chosen), "delay_minutes": delay, "delay_cause": cause,
+           "alert_source": source, "replan": rp}
+    with st.spinner("Re-planning..."):
+        st.session_state["rp"] = (rp, core.llm_plan(ctx))
+    st.session_state["rp_source"] = f"{source} at {datetime.now().strftime('%I:%M %p')}"
+    return st.session_state["rp"]
+
+
+@st.fragment(run_every=60)
+def live_panel(chosen, ident):
+    """Re-runs every 60 s while watching. Triggers a re-plan (and team text) when a new delay appears."""
+    arrive = (st.session_state.get("charter") or core.CharterDetails()).arrive if chosen.mode == "Charter" else "SAN"
+    imp = live.faa_impact(origin, chosen.mode, arrive)
+    fs = live.flight_status(ident, booked_departure(chosen)) if ident and live.aeroapi_enabled() else None
+
+    st.write(f"**FAA** · {origin} → {arrive}: " +
+             ("; ".join(e["summary"] for e in imp["events"]) if imp["events"] else "✅ no delay programs affecting this trip"))
+    st.caption(imp["source"])
+    for n in imp["notes"]:
+        st.info(n)
+    delay, cause, departed, source = imp["delay_min"], "", False, "live FAA airport status"
+    if imp["events"]:
+        cause = imp["events"][0]["summary"]
+    if ident and not live.aeroapi_enabled():
+        st.caption(f"{ident}: per-flight status off (add AEROAPI_KEY to .env).")
+    elif fs is not None:
+        if fs["ok"]:
+            icon = "❌" if fs["cancelled"] else "⏱" if fs["delay_min"] >= LIVE_TRIGGER_MIN else "✅"
+            eta = fs["estimated_in"].strftime("%I:%M %p") if fs["estimated_in"] else "?"
+            st.write(f"**{fs['ident']}** {icon} {fs['status'] or 'scheduled'} · "
+                     f"{'+' + str(fs['delay_min']) + ' min · ' if fs['delay_min'] else ''}ETA SAN {eta}")
+            departed = fs["departed"]
+            if fs["cancelled"]:
+                delay, cause, source = 240, f"{fs['ident']} cancelled", "FlightAware (cancellation)"
+            elif fs["delay_min"] >= delay:
+                delay, cause, source = fs["delay_min"], f"{fs['ident']} airline-reported delay", "FlightAware flight status"
+        st.caption(fs["note"])
+    st.caption(f"Checked {datetime.now().strftime('%I:%M:%S %p')} · refreshes every 60 s")
+
+    key = f"{chosen.label}|{delay // 15}|{cause[:40]}"
+    if delay >= LIVE_TRIGGER_MIN and key != st.session_state.get("last_live_key"):
+        st.session_state["last_live_key"] = key
+        _, plan = run_replan(chosen, delay, cause, departed, datetime.now().replace(second=0, microsecond=0), source)
+        if notify is not None and notify.enabled() and st.session_state.get("auto_notify", True):
+            p = plan[0]
+            ok, note = notify.send_alert(f"OrganRoute {p.get('status', '').upper()}: {p.get('recommendation', '')}"[:120],
+                                         p.get("message_draft", ""), p.get("status", "yellow"))
+            st.session_state["rp_source"] += f" · team {'texted' if ok else 'NOT texted'} ({note[:80]})"
+        st.rerun()  # full rerun so the re-plan shows below
+
+
 with tab2:
     bookable = st.session_state.get("opts", [])
     if not bookable:
@@ -156,20 +227,41 @@ with tab2:
         if chosen.mode == "Charter":
             st.caption("There's no public charter delay history, so you set the delay; the app recomputes the margin and backups.")
         if st.button("🚨 Simulate delay alert", type="primary"):
-            alert_time = datetime.strptime(chosen.depart, "%a %I:%M %p")
-            alert_time = crossclamp.replace(hour=alert_time.hour, minute=alert_time.minute)
-            if alert_time < crossclamp:
-                alert_time += timedelta(days=1)
-            alert_time -= timedelta(minutes=30)  # alert arrives ~30 min before scheduled departure
-            rp = core.replan(df, organ, origin, hospital, crossclamp, chosen, delay, alert_time, departed,
-                             st.session_state.get("charter"))
-            ctx = {"phase": "replan", "organ": organ, "origin": origin, "hospital": hospital,
-                   "booked_transport": asdict(chosen), "delay_minutes": delay, "delay_cause": cause,
-                   "replan": rp}
-            with st.spinner("Re-planning..."):
-                st.session_state["rp"] = (rp, core.llm_plan(ctx))
+            alert_time = booked_departure(chosen) - timedelta(minutes=30)  # alert ~30 min before departure
+            run_replan(chosen, delay, cause, departed, alert_time, "simulated")
+
+        # ---- Live watch: real FAA airport delays (+ FlightAware per-flight status if configured) ----
+        st.markdown("#### 📡 Live watch")
+        if chosen.mode == "Ground":
+            st.caption("Live feeds cover flights only; use the simulator above for road delays.")
+        else:
+            w1, w2 = st.columns([3, 1])
+            ident = ""
+            if chosen.mode == "Commercial":
+                ident = w1.text_input(
+                    "Booked flight number (optional, e.g. WN1234)", key="ident",
+                    help="With AEROAPI_KEY in .env, the app checks this exact flight on FlightAware "
+                         "(capped monthly). Without it, it watches FAA airport-level delays only."
+                ).replace(" ", "").upper()
+            else:
+                w1.caption("Charters usually aren't trackable by flight number; watching FAA delays at the origin.")
+            watching = st.session_state.get("watching", False)
+            if w2.button("⏹ Stop watching" if watching else "▶️ Start watching", key="watch_btn"):
+                st.session_state["watching"] = not watching
+                st.session_state.pop("last_live_key", None)
+                st.rerun()
+            if notify is not None:
+                if notify.enabled():
+                    st.toggle("Text the team automatically on live alerts", value=True, key="auto_notify")
+                else:
+                    st.caption("Add Twilio settings to .env to text the team automatically on live alerts.")
+            if st.session_state.get("watching"):
+                live_panel(chosen, ident)
+
         if "rp" in st.session_state:
             rp, plan = st.session_state["rp"]
+            if st.session_state.get("rp_source"):
+                st.caption(f"Re-plan triggered by: {st.session_state['rp_source']}")
             c1, c2, c3 = st.columns(3)
             c1.metric("New hospital ETA", rp["current_flight_new_arrival"])
             c2.metric("Deadline", rp["deadline"])
