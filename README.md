@@ -12,10 +12,8 @@ Decision support for San Diego organ transport (Life Sharing, UC San Diego Healt
 ## Run
 ```bash
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=...     # app falls back to rules without a key
-# optional: switch provider with one line
-# export AI_PROVIDER=openai  (needs OPENAI_API_KEY)   or   AI_PROVIDER=gemini  (needs GEMINI_API_KEY)
-# export AI_MODEL=...        override the default model for that provider
+cp .env.example .env         # then paste your ANTHROPIC_API_KEY into .env
+                             # (switch provider there with AI_PROVIDER=openai|gemini; app falls back to rules without a key)
 python data_prep.py On_Time_*.csv   # optional: builds flights_san.csv from BTS downloads
 streamlit run app.py
 ```

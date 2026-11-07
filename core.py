@@ -20,6 +20,12 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
+try:  # load API keys / AI_PROVIDER from a local .env file if present
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # Constants / assumptions (state these in the demo!)
 # ---------------------------------------------------------------------------
@@ -258,7 +264,12 @@ def ground_option(origin, hospital, ready_at_origin_hosp: datetime, dl: datetime
                   _fmt(at_hosp), int(slack), p, "$$", f"~{miles:.0f} road mi @ {GROUND_MPH} mph (assumption)")
 
 
-def build_options(df, organ, origin, hospital, crossclamp: datetime) -> tuple[datetime, list[Option]]:
+MODES = ["Compare all", "Commercial", "Charter", "Ground"]
+
+
+def build_options(df, organ, origin, hospital, crossclamp: datetime,
+                  mode: str = "Compare all") -> tuple[datetime, list[Option]]:
+    """mode limits the options to one transport type (e.g. when the team always charters)."""
     dl = deadline(organ, crossclamp)
     ready_hosp = crossclamp  # organ leaves donor hospital at cross-clamp (simplification)
     ready_airport = ready_hosp + timedelta(minutes=ORIGIN_HOSPITAL_TO_AIRPORT_MIN)
@@ -267,6 +278,8 @@ def build_options(df, organ, origin, hospital, crossclamp: datetime) -> tuple[da
     g = ground_option(origin, hospital, ready_hosp, dl)
     if g:
         opts.append(g)
+    if mode != "Compare all":
+        opts = [o for o in opts if o.mode == mode]
     return dl, rank(opts)
 
 
@@ -278,7 +291,8 @@ def rank(opts: list[Option]) -> list[Option]:
 
 def replan(df, organ, origin, hospital, crossclamp: datetime, chosen: Option,
            delay_min: int, now: datetime, departed: bool) -> dict:
-    """Recompute after a delay alert on the chosen commercial flight."""
+    """Recompute after a delay alert on the booked option (commercial, charter, or ground).
+    Backups always include every transport type: in a delay, any mode is on the table."""
     dl = deadline(organ, crossclamp)
     new_arrival = datetime.strptime(chosen.arrive_hospital, "%a %I:%M %p")
     # re-anchor the parsed time to the right date
@@ -290,7 +304,17 @@ def replan(df, organ, origin, hospital, crossclamp: datetime, chosen: Option,
     backups: list[Option] = []
     if not departed:
         backups += [o for o in commercial_options(df, origin, hospital, now, dl, n=4) if o.label != chosen.label][:3]
-        backups.append(charter_option(origin, hospital, now - timedelta(minutes=ORIGIN_HOSPITAL_TO_AIRPORT_MIN), dl))
+        if chosen.mode == "Charter":
+            # booked charter is stuck: a second operator needs a full callout from now
+            alt = charter_option(origin, hospital, now, dl)
+            alt.label = f"Backup charter (different operator) {origin} -> MYF"
+        else:
+            alt = charter_option(origin, hospital, now - timedelta(minutes=ORIGIN_HOSPITAL_TO_AIRPORT_MIN), dl)
+        backups.append(alt)
+        if chosen.mode != "Ground":
+            g = ground_option(origin, hospital, now, dl)
+            if g:
+                backups.append(g)
     return {
         "deadline": _fmt(dl),
         "current_flight_new_arrival": _fmt(new_arrival),
@@ -407,7 +431,9 @@ def llm_plan(context: dict) -> tuple[dict, str]:
         return fb, "fallback"
     default_model, key_vars = PROVIDERS[provider]
     if not any(os.environ.get(k) for k in key_vars):
-        return rule_plan(context), "fallback"
+        fb = rule_plan(context)
+        fb["reasoning"] += f" (No {' / '.join(key_vars)} found; check .env and that python-dotenv is installed. Rule fallback.)"
+        return fb, "fallback"
     try:
         model = os.environ.get("AI_MODEL", default_model)
         return _CALLERS[provider](context, model), provider
@@ -426,16 +452,20 @@ def rule_plan(context: dict) -> dict:
     if "replan" in context:
         rp = context["replan"]
         spare = rp["current_flight_minutes_to_spare"]
+        what = {"Charter": "charter", "Ground": "courier"}.get(context.get("booked_transport", {}).get("mode"), "flight")
         if spare >= 60:
-            return {"status": "green", "recommendation": "Stay on the current flight.",
+            return {"status": "green", "recommendation": f"Stay on the current {what}.",
                     "reasoning": f"Still {spare} min to spare after the delay.",
                     "notify": ["Recipient transplant surgeon"],
-                    "message_draft": f"Organ flight delayed; new ETA {rp['current_flight_new_arrival']}. Still within window."}
-        rec = f"Switch to: {best['label']}" if best and best["minutes_to_spare"] > 0 else "Keep flight; prepare backup recipient / adjust OR start."
+                    "message_draft": f"Organ {what} delayed; new ETA {rp['current_flight_new_arrival']}. Still within window."}
+        rec = f"Switch to: {best['label']}" if best and best["minutes_to_spare"] > 0 else f"Keep {what}; prepare backup recipient / adjust OR start."
+        notify = ["Recipient transplant surgeon", "OR charge nurse", "Life Sharing coordinator"]
+        if what == "charter" or (best and best["mode"] == "Charter"):
+            notify.append("Charter dispatch")
         return {"status": "red" if spare < 0 else "yellow", "recommendation": rec,
-                "reasoning": f"Current flight leaves {spare} min to spare.",
-                "notify": ["Recipient transplant surgeon", "OR charge nurse", "Life Sharing coordinator"],
-                "message_draft": f"URGENT: organ flight delayed, {spare} min margin. Plan: {rec}"}
+                "reasoning": f"Current {what} leaves {spare} min to spare.",
+                "notify": notify,
+                "message_draft": f"URGENT: organ {what} delayed, {spare} min margin. Plan: {rec}"}
     if not best:
         return {"status": "red", "recommendation": "No feasible option found.", "reasoning": "",
                 "notify": [], "message_draft": ""}

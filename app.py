@@ -68,23 +68,39 @@ with st.sidebar:
     t = st.time_input("Cross-clamp time (San Diego time)", (now + timedelta(hours=1)).time())
     crossclamp = datetime.combine(d, t)
     st.caption(f"Viability window: ~{core.VIABILITY_HOURS[organ]} h")
+    mode = st.radio("Transport type", core.MODES, index=0,
+                    help="Pick one type if your team already knows how this organ will travel "
+                         "(e.g. a recovery team that always flies charter). 'Compare all' ranks every option.")
+
+MODE_NOTES = {
+    "Commercial": "Showing scheduled flights into SAN only. On-time chances come from real BTS delay history.",
+    "Charter": "Showing charter only. **Charter delays aren't in any public dataset**, so its on-time chance is an "
+               f"assumption ({core.CHARTER_RELIABILITY:.0%} reliability, {core.CHARTER_CALLOUT_H} h callout), not a "
+               "prediction. Main risks are weather, crew availability, and mechanical issues; use tab 2 to plan for a delay.",
+    "Ground": "Showing ground courier only (within ~400 road miles). Travel time is a distance-based estimate.",
+}
 
 tab1, tab2, tab3 = st.tabs(["1 · Plan transport", "2 · Delay alert → re-plan",
                            "3 · Recovery agent demo"])
 
 # ---------------- Tab 1: Planning ----------------
 with tab1:
-    dl, opts = core.build_options(df, organ, origin, hospital, crossclamp)
+    dl, opts = core.build_options(df, organ, origin, hospital, crossclamp, mode)
     st.session_state["opts"] = opts
     c1, c2, c3 = st.columns(3)
     c1.metric("Cross-clamp", crossclamp.strftime("%I:%M %p"))
     c2.metric("Must arrive by", dl.strftime("%a %I:%M %p"))
     c3.metric("Window", f"{core.VIABILITY_HOURS[organ]} h")
     st.subheader("Options")
+    if mode in MODE_NOTES:
+        st.info(MODE_NOTES[mode])
+    if not opts and mode == "Ground":
+        st.warning(f"{origin} is too far for ground transport. Try Charter or Compare all.")
     options_table(opts)
     if st.button("Get recommendation", type="primary"):
         ctx = {"phase": "planning", "organ": organ, "origin": origin, "hospital": hospital,
-               "crossclamp": crossclamp, "deadline": dl, "options": [asdict(o) for o in opts]}
+               "crossclamp": crossclamp, "deadline": dl, "transport_type_requested": mode,
+               "options": [asdict(o) for o in opts]}
         with st.spinner("Thinking..."):
             st.session_state["plan1"] = core.llm_plan(ctx)
     if "plan1" in st.session_state:
@@ -92,14 +108,26 @@ with tab1:
 
 # ---------------- Tab 2: Re-planning ----------------
 with tab2:
-    commercial = [o for o in st.session_state.get("opts", []) if o.mode == "Commercial"]
-    if not commercial:
-        st.info("No commercial flight to simulate. Pick a different origin/organ.")
+    bookable = st.session_state.get("opts", [])
+    if not bookable:
+        st.info("No transport options to simulate. Pick a different origin or transport type in the sidebar.")
     else:
-        chosen = st.selectbox("Booked flight", commercial, format_func=lambda o: f"{o.label} → hospital {o.arrive_hospital}")
-        c1, c2 = st.columns(2)
+        st.caption("Pick what was booked in tab 1, then simulate an alert. Backups include every transport type, "
+                   "even if tab 1 was limited to one.")
+        chosen = st.selectbox("Booked transport", bookable,
+                              format_func=lambda o: f"[{o.mode}] {o.label} → hospital {o.arrive_hospital}")
+        causes = {"Commercial": ["Airline delay", "Weather", "Air traffic control", "Cancellation risk"],
+                  "Charter": ["Weather", "Crew availability", "Mechanical", "Air traffic control"],
+                  "Ground": ["Traffic", "Road closure", "Vehicle issue"]}[chosen.mode]
+        en_route = {"Commercial": ("At gate (not departed)", "In the air"),
+                    "Charter": ("Not departed yet", "In the air"),
+                    "Ground": ("Not departed yet", "On the road")}[chosen.mode]
+        c1, c2, c3 = st.columns(3)
         delay = c1.slider("Delay alert (minutes)", 15, 240, 75, step=15)
-        departed = c2.radio("Flight status", ["At gate (not departed)", "In the air"]) == "In the air"
+        cause = c2.selectbox("Cause", causes)
+        departed = c3.radio("Status", en_route) == en_route[1]
+        if chosen.mode == "Charter":
+            st.caption("There's no public charter delay history, so you set the delay; the app recomputes the margin and backups.")
         if st.button("🚨 Simulate delay alert", type="primary"):
             alert_time = datetime.strptime(chosen.depart, "%a %I:%M %p")
             alert_time = crossclamp.replace(hour=alert_time.hour, minute=alert_time.minute)
@@ -108,7 +136,8 @@ with tab2:
             alert_time -= timedelta(minutes=30)  # alert arrives ~30 min before scheduled departure
             rp = core.replan(df, organ, origin, hospital, crossclamp, chosen, delay, alert_time, departed)
             ctx = {"phase": "replan", "organ": organ, "origin": origin, "hospital": hospital,
-                   "booked_flight": asdict(chosen), "delay_minutes": delay, "replan": rp}
+                   "booked_transport": asdict(chosen), "delay_minutes": delay, "delay_cause": cause,
+                   "replan": rp}
             with st.spinner("Re-planning..."):
                 st.session_state["rp"] = (rp, core.llm_plan(ctx))
         if "rp" in st.session_state:
