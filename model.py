@@ -1,140 +1,166 @@
 
-import json
+"""
+OrganRoute SD - Flight Risk Prediction Model
+
+Predicts:
+1. Cancellation probability
+2. Diversion probability
+3. Probability of arriving later than allowed slack
+4. Probability of arriving within allowed slack
+
+Uses historical flight data.
+Not validated for real-world medical transport decisions.
+"""
+
+import os
+import __main__
+
 import joblib
 import numpy as np
 import pandas as pd
 
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
-from sklearn.pipeline import Pipeline
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import roc_auc_score, brier_score_loss
+from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
 
 
 # ============================================================
 # 1. CONFIGURATION
 # ============================================================
 
-DATA_PATH = "flights_san.csv"
-MODEL_PATH = "flight_delay_model.pkl"
+DATA_PATH = "data/san_dataset_out/flights_clean.csv"
+
+TRAINED_MODEL_PATH = "flight_delay_model.pkl"
+CALIBRATED_MODEL_PATH = "flight_delay_model_calibrated.pkl"
+
+# Default predictions use the calibrated model.
+MODEL_PATH = CALIBRATED_MODEL_PATH
 
 FEATURES = [
     "Origin",
     "Reporting_Airline",
+    "Dest",
     "departure_hour",
     "DayOfWeek",
     "Month",
 ]
 
-CATEGORICAL = ["Origin", "Reporting_Airline"]
-NUMERIC = ["departure_hour", "DayOfWeek", "Month"]
+CATEGORICAL = [
+    "Origin",
+    "Reporting_Airline",
+    "Dest",
+]
+
+NUMERIC = [
+    "departure_hour",
+    "DayOfWeek",
+    "Month",
+]
 
 THRESHOLDS = (0, 15, 30, 45, 60, 90, 120, 180, 240)
 
 
 # ============================================================
-# 2. CONSTANT PROBABILITY MODEL
+# 2. DATA PREPARATION
 # ============================================================
-
-class ConstantProbability:
-    """Fallback when training data contains only one outcome."""
-
-    def __init__(self, probability):
-        self.probability = float(probability)
-
-    def predict_proba(self, X):
-        n = len(X)
-        p = self.probability
-        return np.column_stack([
-            np.full(n, 1.0 - p),
-            np.full(n, p),
-        ])
-
-
-# ============================================================
-# 3. FEATURE PREPARATION
-# ============================================================
-
-def _make_features(df):
-    X = df[FEATURES].copy()
-
-    for col in CATEGORICAL:
-        X[col] = X[col].fillna("UNKNOWN").astype(str)
-
-    for col in NUMERIC:
-        X[col] = pd.to_numeric(X[col], errors="coerce")
-
-    return X
-
 
 def _prepare(df):
+    df = df.copy()
+
+    rename_map = {
+        "flight_date": "FlightDate",
+        "carrier": "Reporting_Airline",
+        "origin": "Origin",
+        "dest": "Dest",
+        "dep_hour": "departure_hour",
+        "day_of_week": "DayOfWeek",
+        "month": "Month",
+        "arr_delay_min": "ArrDelay",
+    }
+
+    df = df.rename(columns=rename_map)
+
     required = [
         "FlightDate",
-        "Origin",
         "Reporting_Airline",
-        "CRSDepTime",
+        "Origin",
+        "Dest",
+        "departure_hour",
         "DayOfWeek",
         "Month",
-        "Cancelled",
-        "Diverted",
         "ArrDelay",
+        "cancelled",
+        "diverted",
     ]
 
-    missing = [col for col in required if col not in df.columns]
+    missing = [c for c in required if c not in df.columns]
 
     if missing:
         raise ValueError(
-            f"Missing required dataset columns: {missing}"
+            f"Missing dataset columns: {missing}"
         )
 
-    df = df.copy()
-
     df["FlightDate"] = pd.to_datetime(
-        df["FlightDate"], errors="coerce"
+        df["FlightDate"],
+        errors="coerce",
     )
 
-    numeric_cols = [
-        "CRSDepTime",
+    weekday_map = {
+        "Monday": 1,
+        "Tuesday": 2,
+        "Wednesday": 3,
+        "Thursday": 4,
+        "Friday": 5,
+        "Saturday": 6,
+        "Sunday": 7,
+    }
+
+    df["DayOfWeek"] = df["DayOfWeek"].map(
+        lambda x: weekday_map.get(x, x)
+    )
+
+    for column in [
+        "departure_hour",
         "DayOfWeek",
         "Month",
-        "Cancelled",
-        "Diverted",
         "ArrDelay",
-    ]
+        "cancelled",
+        "diverted",
+    ]:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
 
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for column in CATEGORICAL:
+        df[column] = df[column].astype("string")
 
-    df = df.dropna(subset=[
-        "FlightDate",
-        "Origin",
-        "Reporting_Airline",
-        "CRSDepTime",
-        "DayOfWeek",
-        "Month",
-        "Cancelled",
-        "Diverted",
-    ]).copy()
+    df = df.dropna(
+        subset=[
+            "FlightDate",
+            "Origin",
+            "Reporting_Airline",
+            "Dest",
+            "departure_hour",
+            "DayOfWeek",
+            "Month",
+            "cancelled",
+            "diverted",
+        ]
+    ).copy()
 
     df = df[
-        df["Cancelled"].isin([0, 1])
-        & df["Diverted"].isin([0, 1])
+        df["departure_hour"].between(0, 23)
         & df["DayOfWeek"].between(1, 7)
         & df["Month"].between(1, 12)
-        & df["CRSDepTime"].between(0, 2359)
     ].copy()
 
-    hours = (df["CRSDepTime"] // 100).astype(int)
-    minutes = (df["CRSDepTime"] % 100).astype(int)
-
-    df = df[minutes < 60].copy()
-
-    df["departure_hour"] = hours.loc[df.index]
-
-    df["cancelled"] = df["Cancelled"].astype(int)
-    df["diverted"] = df["Diverted"].astype(int)
+    df["cancelled"] = df["cancelled"].astype(int)
+    df["diverted"] = df["diverted"].astype(int)
 
     df["completed"] = (
         (df["cancelled"] == 0)
@@ -142,78 +168,85 @@ def _prepare(df):
         & df["ArrDelay"].notna()
     )
 
-    df = df.sort_values("FlightDate").reset_index(drop=True)
+    return df.sort_values(
+        "FlightDate"
+    ).reset_index(drop=True)
 
-    if len(df) < 100:
-        raise ValueError(
-            "Not enough usable flight records for training."
+
+def _make_features(df):
+    X = df[FEATURES].copy()
+
+    for column in CATEGORICAL:
+        X[column] = X[column].astype(str)
+
+    for column in NUMERIC:
+        X[column] = pd.to_numeric(
+            X[column],
+            errors="coerce",
         )
 
-    return df
+    return X
 
 
 # ============================================================
-# 4. CHRONOLOGICAL DATA SPLIT
+# 3. CHRONOLOGICAL DATA SPLIT
 # ============================================================
 
 def _time_splits(df):
-    """Split by date: 60% train, 20% validation, 20% test."""
+    dates = np.sort(
+        df["FlightDate"].dropna().unique()
+    )
 
-    dates = np.sort(df["FlightDate"].dt.normalize().unique())
-
-    if len(dates) < 5:
+    if len(dates) < 3:
         raise ValueError(
-            "At least five distinct flight dates are required."
+            "Not enough dates for a time split."
         )
 
-    train_end = max(1, int(len(dates) * 0.60))
-    val_end = max(train_end + 1, int(len(dates) * 0.80))
+    first = max(1, int(len(dates) * 0.60))
+    second = max(first + 1, int(len(dates) * 0.80))
 
-    if val_end >= len(dates):
-        raise ValueError("Insufficient dates for test split.")
+    first = min(first, len(dates) - 2)
+    second = min(second, len(dates) - 1)
 
-    train_cutoff = dates[train_end]
-    test_cutoff = dates[val_end]
-
-    train = df[df["FlightDate"] < train_cutoff].copy()
-
-    val = df[
-        (df["FlightDate"] >= train_cutoff)
-        & (df["FlightDate"] < test_cutoff)
+    train = df[
+        df["FlightDate"].isin(dates[:first])
     ].copy()
 
-    test = df[df["FlightDate"] >= test_cutoff].copy()
+    val = df[
+        df["FlightDate"].isin(
+            dates[first:second]
+        )
+    ].copy()
 
-    if min(len(train), len(val), len(test)) == 0:
-        raise ValueError("One of the data splits is empty.")
+    test = df[
+        df["FlightDate"].isin(
+            dates[second:]
+        )
+    ].copy()
 
     return train, val, test
 
 
 # ============================================================
-# 5. MACHINE LEARNING PIPELINES
+# 4. MODEL PIPELINES
 # ============================================================
 
 def _pipeline(kind):
     if kind == "logistic":
+
         preprocessor = ColumnTransformer([
             (
                 "categorical",
-                Pipeline([
-                    (
-                        "imputer",
-                        SimpleImputer(strategy="most_frequent"),
-                    ),
-                    (
-                        "encoder",
-                        OneHotEncoder(handle_unknown="ignore"),
-                    ),
-                ]),
+                OneHotEncoder(
+                    handle_unknown="ignore"
+                ),
                 CATEGORICAL,
             ),
             (
                 "numeric",
-                SimpleImputer(strategy="median"),
+                SimpleImputer(
+                    strategy="median"
+                ),
                 NUMERIC,
             ),
         ])
@@ -224,6 +257,7 @@ def _pipeline(kind):
         )
 
     elif kind == "boosting":
+
         preprocessor = ColumnTransformer([
             (
                 "categorical",
@@ -235,7 +269,9 @@ def _pipeline(kind):
             ),
             (
                 "numeric",
-                SimpleImputer(strategy="median"),
+                SimpleImputer(
+                    strategy="median"
+                ),
                 NUMERIC,
             ),
         ])
@@ -244,12 +280,13 @@ def _pipeline(kind):
             max_iter=150,
             learning_rate=0.05,
             max_leaf_nodes=15,
-            l2_regularization=1.0,
             random_state=42,
         )
 
     else:
-        raise ValueError(f"Unknown model type: {kind}")
+        raise ValueError(
+            f"Unknown model type: {kind}"
+        )
 
     return Pipeline([
         ("preprocessor", preprocessor),
@@ -257,187 +294,335 @@ def _pipeline(kind):
     ])
 
 
-# ============================================================
-# 6. EVALUATION METRICS
-# ============================================================
-
-def _scores(y_true, probabilities):
-    y = np.asarray(y_true, dtype=int)
-    p = np.clip(np.asarray(probabilities), 0.0, 1.0)
-
+def _scores(y, p):
     result = {
-        "brier": round(float(brier_score_loss(y, p)), 5),
-        "positive_rate": round(float(np.mean(y)), 5),
-        "samples": len(y),
+        "brier": float(
+            brier_score_loss(y, p)
+        ),
+        "positive_rate": float(
+            np.mean(y)
+        ),
+        "samples": int(len(y)),
     }
 
-    if len(np.unique(y)) == 2:
-        result["roc_auc"] = round(
-            float(roc_auc_score(y, p)), 5
-        )
-    else:
-        result["roc_auc"] = None
+    result["roc_auc"] = (
+        float(roc_auc_score(y, p))
+        if len(np.unique(y)) == 2
+        else None
+    )
 
     return result
 
 
 # ============================================================
-# 7. TRAIN ONE PREDICTION TASK
+# 5. TRAIN ONE TASK
 # ============================================================
 
-def _train_task(train, val, test, target):
+def _train_task(
+    name,
+    train,
+    val,
+    test,
+    target,
+):
     X_train = _make_features(train)
     X_val = _make_features(val)
     X_test = _make_features(test)
 
-    y_train = train[target].astype(int)
-    y_val = val[target].astype(int)
-    y_test = test[target].astype(int)
+    y_train = np.asarray(
+        target(train),
+        dtype=int,
+    )
 
-    if y_train.nunique() < 2:
-        model = ConstantProbability(y_train.mean())
-        selected = "constant"
+    y_val = np.asarray(
+        target(val),
+        dtype=int,
+    )
 
-    else:
-        candidates = {}
+    y_test = np.asarray(
+        target(test),
+        dtype=int,
+    )
 
-        for kind in ("logistic", "boosting"):
-            model_candidate = _pipeline(kind)
-
-            model_candidate.fit(X_train, y_train)
-
-            predictions = model_candidate.predict_proba(
-                X_val
-            )[:, 1]
-
-            score = brier_score_loss(y_val, predictions)
-
-            candidates[kind] = (
-                score,
-                model_candidate,
-            )
-
-        selected = min(
-            candidates,
-            key=lambda name: candidates[name][0],
+    if len(np.unique(y_train)) < 2:
+        raise ValueError(
+            f"Only one class in {name}"
         )
 
-        model = candidates[selected][1]
+    best_model = None
+    best_kind = None
+    best_brier = float("inf")
 
-    probabilities = model.predict_proba(X_test)[:, 1]
+    for kind in ("logistic", "boosting"):
+        model = _pipeline(kind)
 
-    metrics = _scores(y_test, probabilities)
-    metrics["selected_model"] = selected
+        model.fit(X_train, y_train)
 
-    return model, metrics
+        p_val = model.predict_proba(
+            X_val
+        )[:, 1]
+
+        score = brier_score_loss(
+            y_val,
+            p_val,
+        )
+
+        if score < best_brier:
+            best_brier = score
+            best_model = model
+            best_kind = kind
+
+    p_test = best_model.predict_proba(
+        X_test
+    )[:, 1]
+
+    metrics = _scores(y_test, p_test)
+
+    metrics["model_type"] = best_kind
+    metrics["validation_brier"] = float(
+        best_brier
+    )
+
+    print(
+        f"{name:15s} "
+        f"Brier={metrics['brier']:.5f} "
+        f"Model={best_kind}",
+        flush=True,
+    )
+
+    return best_model, metrics
 
 
 # ============================================================
-# 8. TRAIN ALL MODELS
+# 6. TRAIN ALL MODELS
 # ============================================================
 
 def train_model(
     data_path=DATA_PATH,
-    model_path=MODEL_PATH,
+    model_path=TRAINED_MODEL_PATH,
 ):
-    print("Loading flight dataset...")
+    print(
+        "Loading historical flights...",
+        flush=True,
+    )
 
-    df = _prepare(pd.read_csv(data_path))
+    df = _prepare(
+        pd.read_csv(data_path)
+    )
 
     train, val, test = _time_splits(df)
 
-    print("Training flights:", len(train))
-    print("Validation flights:", len(val))
-    print("Testing flights:", len(test))
+    print("Train:", len(train))
+    print("Validation:", len(val))
+    print("Test:", len(test))
 
     models = {}
     metrics = {}
 
-    # Cancellation model: all flights
-    print("\nTraining cancellation model...")
-
-    models["cancelled"], metrics["cancelled"] = _train_task(
-        train, val, test, "cancelled"
+    model, score = _train_task(
+        "cancelled",
+        train,
+        val,
+        test,
+        lambda d: d["cancelled"],
     )
 
-    # Diversion model: flights that were not cancelled
-    print("Training diversion model...")
+    models["cancelled"] = model
+    metrics["cancelled"] = score
 
-    operating = tuple(
-        part[part["cancelled"] == 0].copy()
-        for part in (train, val, test)
+    operating_train = train[
+        train["cancelled"] == 0
+    ]
+
+    operating_val = val[
+        val["cancelled"] == 0
+    ]
+
+    operating_test = test[
+        test["cancelled"] == 0
+    ]
+
+    model, score = _train_task(
+        "diverted",
+        operating_train,
+        operating_val,
+        operating_test,
+        lambda d: d["diverted"],
     )
 
-    if min(len(part) for part in operating) == 0:
-        raise ValueError(
-            "Insufficient operating flights for diversion model."
-        )
+    models["diverted"] = model
+    metrics["diverted"] = score
 
-    models["diverted"], metrics["diverted"] = _train_task(
-        *operating, "diverted"
-    )
+    completed_train = train[
+        train["completed"]
+    ]
 
-    # Arrival delay models: completed flights only
-    print("Training arrival delay models...")
+    completed_val = val[
+        val["completed"]
+    ]
 
-    complete = tuple(
-        part[part["completed"]].copy()
-        for part in (train, val, test)
-    )
-
-    if min(len(part) for part in complete) == 0:
-        raise ValueError(
-            "Insufficient completed flights for delay models."
-        )
+    completed_test = test[
+        test["completed"]
+    ]
 
     for threshold in THRESHOLDS:
-        target = f"delay_gt_{threshold}"
+        name = f"delay_gt_{threshold}"
 
-        for part in complete:
-            part[target] = (
-                part["ArrDelay"] > threshold
-            ).astype(int)
-
-        models[target], metrics[target] = _train_task(
-            *complete, target
+        model, score = _train_task(
+            name,
+            completed_train,
+            completed_val,
+            completed_test,
+            lambda d, t=threshold: (
+                d["ArrDelay"] > t
+            ).astype(int),
         )
 
-        print(f"Trained delay > {threshold} minutes")
+        models[name] = model
+        metrics[name] = score
 
     bundle = {
-        "version": 2,
-        "features": FEATURES,
-        "thresholds": THRESHOLDS,
+        "version": 3,
         "models": models,
         "metrics": metrics,
-        "train_end": str(train["FlightDate"].max().date()),
-        "validation_end": str(val["FlightDate"].max().date()),
-        "test_end": str(test["FlightDate"].max().date()),
+        "features": FEATURES,
+        "thresholds": THRESHOLDS,
     }
 
-    joblib.dump(bundle, model_path)
+    joblib.dump(
+        bundle,
+        model_path,
+    )
 
-    print("\nMODEL EVALUATION")
-    print(json.dumps(metrics, indent=2))
-
-    print("\nModel saved:", model_path)
+    print(
+        f"\nSaved trained model: {model_path}"
+    )
 
     return bundle
 
 
 # ============================================================
-# 9. CONSISTENT DELAY PROBABILITIES
+# 7. LOAD MODEL - FIX SIGMOID CALIBRATOR ERROR
 # ============================================================
 
-def _monotonic_delay_probabilities(models, X):
+def _load_model(model_path):
+    """
+    Load an existing model, including calibrated models
+    saved when calibrate_model.py ran as __main__.
+    """
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"Model not found: {model_path}"
+        )
+
+    # The calibrated pickle references
+    # __main__.SigmoidCalibrator.
+    #
+    # Register the same class before loading.
+    # This avoids the AttributeError.
+    from calibrate_model import SigmoidCalibrator
+
+    __main__.SigmoidCalibrator = SigmoidCalibrator
+
+    # Only load trusted local model files.
+    bundle = joblib.load(model_path)
+
+    if (
+        bundle.get("version") not in (3, 4)
+        or tuple(
+            bundle.get("thresholds", ())
+        ) != THRESHOLDS
+        or list(
+            bundle.get("features", ())
+        ) != FEATURES
+    ):
+        raise ValueError(
+            "Incompatible saved model."
+        )
+
+    if bundle["version"] == 4:
+        required = {
+            "cancelled",
+            "diverted",
+            *[
+                f"delay_gt_{t}"
+                for t in THRESHOLDS
+            ],
+        }
+
+        if not required.issubset(
+            bundle.get("calibrators", {})
+        ):
+            raise ValueError(
+                "Calibrated model is missing calibrators."
+            )
+
+    return bundle
+
+
+# ============================================================
+# 8. APPLY CALIBRATION
+# ============================================================
+
+def _predict_probability(
+    bundle,
+    name,
+    X,
+):
+    model = bundle["models"][name]
+
+    raw_probability = model.predict_proba(
+        X
+    )[:, 1]
+
+    calibrators = bundle.get(
+        "calibrators",
+        {},
+    )
+
+    if name in calibrators:
+        probability = calibrators[
+            name
+        ].predict(raw_probability)
+    else:
+        probability = raw_probability
+
+    return np.clip(
+        np.asarray(
+            probability,
+            dtype=float,
+        ),
+        0.0,
+        1.0,
+    )
+
+
+# ============================================================
+# 9. DELAY PROBABILITY CURVE
+# ============================================================
+
+def _monotonic_delay_probabilities(
+    bundle,
+    X,
+):
+    thresholds = tuple(
+        bundle["thresholds"]
+    )
+
     probabilities = np.array([
-        models[f"delay_gt_{threshold}"].predict_proba(X)[:, 1]
-        for threshold in THRESHOLDS
+        _predict_probability(
+            bundle,
+            f"delay_gt_{threshold}",
+            X,
+        )
+        for threshold in thresholds
     ]).T
 
-    # More allowed time cannot increase the predicted
-    # probability of exceeding that delay threshold.
-    return np.minimum.accumulate(probabilities, axis=1)
+    return np.minimum.accumulate(
+        probabilities,
+        axis=1,
+    )
 
 
 # ============================================================
@@ -452,14 +637,16 @@ def predict_risk(
     month,
     slack_minutes=60,
     model_path=MODEL_PATH,
+    dest="SAN",
 ):
     """
-    Estimate flight outcome probabilities.
+    Predict flight outcomes using calibrated models.
 
-    slack_minutes is the time available after the
-    flight's scheduled arrival.
+    day_of_week:
+        Monday=1 through Sunday=7
 
-    Supported range: 0 to 240 minutes.
+    slack_minutes:
+        Allowed delay after scheduled arrival.
     """
 
     hour = float(departure_hour)
@@ -468,64 +655,80 @@ def predict_risk(
     slack = float(slack_minutes)
 
     if not 0 <= hour <= 23:
-        raise ValueError("departure_hour must be 0..23")
+        raise ValueError(
+            "departure_hour must be 0..23"
+        )
 
     if not 1 <= day <= 7:
-        raise ValueError("day_of_week must be 1..7")
+        raise ValueError(
+            "day_of_week must be 1..7"
+        )
 
     if not 1 <= month <= 12:
-        raise ValueError("month must be 1..12")
+        raise ValueError(
+            "month must be 1..12"
+        )
 
     if not 0 <= slack <= max(THRESHOLDS):
         raise ValueError(
-            f"slack_minutes must be between "
-            f"0 and {max(THRESHOLDS)}"
+            f"slack_minutes must be "
+            f"0..{max(THRESHOLDS)}"
         )
 
-    # Only load trusted model files.
-    bundle = joblib.load(model_path)
+    # Load model with compatibility fix.
+    bundle = _load_model(model_path)
 
-    if (
-        bundle.get("version") != 2
-        or tuple(bundle.get("thresholds", ())) != THRESHOLDS
-        or bundle.get("features") != FEATURES
-    ):
-        raise ValueError(
-            "Incompatible saved model. Retrain with this model.py."
-        )
+    X = _make_features(
+        pd.DataFrame([{
+            "Origin": str(origin).upper(),
+            "Reporting_Airline": str(
+                airline
+            ).upper(),
+            "Dest": str(dest).upper(),
+            "departure_hour": hour,
+            "DayOfWeek": day,
+            "Month": month,
+        }])
+    )
 
-    X = _make_features(pd.DataFrame([{
-        "Origin": origin,
-        "Reporting_Airline": airline,
-        "departure_hour": hour,
-        "DayOfWeek": day,
-        "Month": month,
-    }]))
-
-    models = bundle["models"]
-
-    # Probability of cancellation
+    # Cancellation probability
     p_cancel = float(
-        models["cancelled"].predict_proba(X)[0, 1]
+        _predict_probability(
+            bundle,
+            "cancelled",
+            X,
+        )[0]
     )
 
-    # Probability of diversion given no cancellation
+    # Diversion probability conditional on operation
     p_divert_if_operated = float(
-        models["diverted"].predict_proba(X)[0, 1]
+        _predict_probability(
+            bundle,
+            "diverted",
+            X,
+        )[0]
     )
 
-    # Probability of exceeding the allowed delay
-    delay_curve = _monotonic_delay_probabilities(
-        models, X
-    )[0]
-
-    p_delay = float(
-        np.interp(slack, THRESHOLDS, delay_curve)
+    # Delay probabilities conditional on completion
+    delay_curve = (
+        _monotonic_delay_probabilities(
+            bundle,
+            X,
+        )[0]
     )
 
-    # Four mutually exclusive flight outcomes
+    p_delay_if_completed = float(
+        np.interp(
+            slack,
+            THRESHOLDS,
+            delay_curve,
+        )
+    )
+
+    # Four mutually exclusive outcomes
     p_divert = (
-        (1.0 - p_cancel) * p_divert_if_operated
+        (1.0 - p_cancel)
+        * p_divert_if_operated
     )
 
     p_completed = (
@@ -533,47 +736,73 @@ def predict_risk(
         * (1.0 - p_divert_if_operated)
     )
 
-    success = p_completed * (1.0 - p_delay)
+    p_late = (
+        p_completed
+        * p_delay_if_completed
+    )
 
-    p_late_but_completed = p_completed * p_delay
+    p_success = (
+        p_completed
+        * (1.0 - p_delay_if_completed)
+    )
 
-    # Verify that all outcomes sum to 100%
     total = (
         p_cancel
         + p_divert
-        + success
-        + p_late_but_completed
+        + p_late
+        + p_success
     )
 
-    if not np.isclose(total, 1.0, atol=1e-8):
+    if not np.isclose(
+        total,
+        1.0,
+        atol=1e-8,
+    ):
         raise RuntimeError(
-            f"Outcome probabilities do not sum to 1: {total}"
+            f"Probabilities sum to {total}"
         )
 
     return {
-        "probability_cancelled": float(p_cancel),
-        "probability_diverted": float(p_divert),
-        "probability_late_but_completed": float(
-            p_late_but_completed
+        "probability_cancelled": p_cancel,
+
+        "probability_diverted": p_divert,
+
+        "probability_late_but_completed": (
+            p_late
         ),
-        "probability_delay_over_slack_if_completed": float(
-            p_delay
+
+        "probability_delay_over_slack_if_completed": (
+            p_delay_if_completed
         ),
-        "probability_arrive_within_slack": float(success),
+
+        "probability_arrive_within_slack": (
+            p_success
+        ),
+
         "slack_minutes": slack,
+
         "delay_curve_conditional_on_completion": {
             str(t): float(p)
-            for t, p in zip(THRESHOLDS, delay_curve)
+            for t, p in zip(
+                THRESHOLDS,
+                delay_curve,
+            )
         },
+
+        "calibrated": (
+            bundle["version"] == 4
+        ),
+
         "note": (
-            "Historical estimate only. Not a guarantee "
-            "or medical transport authorization."
+            "Historical estimate only. "
+            "Not a guarantee or medical transport "
+            "authorization."
         ),
     }
 
 
 # ============================================================
-# 11. RUN TRAINING
+# 11. TRAIN ONLY WHEN RUN DIRECTLY
 # ============================================================
 
 if __name__ == "__main__":
