@@ -20,6 +20,54 @@ python data_prep.py On_Time_*.csv   # optional: builds flights_san.csv from BTS 
 streamlit run app.py
 ```
 
+## Recovery agent demo
+
+The **Recovery agent demo** tab is separate from the original planner. Create a
+simulated mission, enter a transport deadline, and apply a delay, cancellation,
+diversion, or ETA update. The mission starts at a named **hypothetical donor site**;
+the agent examines transfers to both PHX and AZA instead of asking you to pick
+the nearest airport. It stores mission state and plan versions in
+`recovery_demo.sqlite3` (ignored by Git). It requires no LLM key or extra package.
+
+The demo catalog contains invented PHX/AZA/SAN/LAX flight and ground scenarios.
+They are **not current schedules, bookings, road forecasts, or carrier acceptance**.
+The planner marks unconfirmed handoffs and keeps approval with a person. No
+CatBoost artifact or live transport provider is included in this repository;
+flight risk is shown as unavailable unless a trained predictor is supplied.
+The **Record review** action stores a human review of the current plan version;
+it does not confirm transport availability, book a carrier, or authorize a
+medical decision.
+
+Run the deterministic backend tests:
+
+```bash
+python -m unittest -v test_recovery.py test_recovery_agent.py
+```
+
+For event-driven operation, start the worker in a second terminal after creating
+a mission in the app:
+
+```bash
+python recovery_worker.py --database recovery_demo.sqlite3 --events recovery_demo_events.jsonl
+```
+
+Append one JSON object per line to `recovery_demo_events.jsonl`, using the mission
+ID shown in the app. Example (replace `occurred_at` with a current ISO 8601 time
+including a timezone offset):
+
+```json
+{"mission_id":"demo-REPLACE","event_id":"delay-001","event":{"type":"FLIGHT_DELAYED","occurred_at":"2030-01-01T12:00:00+00:00","delay_minutes":60}}
+```
+
+The worker polls this local file and replans automatically. Repeated event IDs
+return the saved plan without applying the delay twice. Click **Refresh recovery
+report** in Streamlit to see a worker-produced plan. This file is a simulation
+event source, not a live flight feed.
+
+The original two tabs retain their existing code and may call the legacy LLM
+planner when a corresponding API key is configured. The recovery tab and worker
+make no LLM calls.
+
 ## How it works
 - **Delay model:** empirical arrival-delay distribution for each origin × airline × departure hour (falling back to coarser slices when there's too little data). P(on time) = P(arrival delay ≤ slack) × (1 − cancellation rate), where slack = deadline − scheduled arrival at the hospital.
 - **Charter / ground:** distance-based estimates with stated assumptions (see constants in `core.py`).

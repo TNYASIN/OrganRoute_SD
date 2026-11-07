@@ -26,6 +26,7 @@ class EventType(str, Enum):
     FLIGHT_CANCELLED = "FLIGHT_CANCELLED"
     FLIGHT_DIVERTED = "FLIGHT_DIVERTED"
     ETA_UPDATED = "ETA_UPDATED"
+    STAGE_UPDATED = "STAGE_UPDATED"
 
 
 def _aware(value: datetime, name: str) -> None:
@@ -43,6 +44,8 @@ class Flight:
     carrier: str = "unverified carrier"
     source: str = "hypothetical_demo"
     verified: bool = False
+    observed_at: datetime | None = None
+    expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _aware(self.departure, "flight departure")
@@ -51,6 +54,10 @@ class Flight:
             raise ValueError("flight arrival must follow departure")
         if not self.flight_id or not self.origin or not self.destination_airport:
             raise ValueError("flight identity and airports are required")
+        if self.observed_at is not None:
+            _aware(self.observed_at, "flight observation time")
+        if self.expires_at is not None:
+            _aware(self.expires_at, "flight expiry time")
 
 
 @dataclass(frozen=True)
@@ -60,10 +67,16 @@ class GroundOption:
     duration_minutes: int
     source: str = "hypothetical_demo"
     verified: bool = False
+    observed_at: datetime | None = None
+    expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.duration_minutes <= 0:
             raise ValueError("ground duration must be positive")
+        if self.observed_at is not None:
+            _aware(self.observed_at, "ground observation time")
+        if self.expires_at is not None:
+            _aware(self.expires_at, "ground expiry time")
 
 
 @dataclass(frozen=True)
@@ -80,6 +93,8 @@ class DisruptionEvent:
     updated_eta: datetime | None = None
     delay_minutes: int | None = None
     diversion_airport: str | None = None
+    new_stage: TransportStage | None = None
+    new_location: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.type, EventType):
@@ -97,6 +112,9 @@ class DisruptionEvent:
             raise ValueError("delay_minutes cannot be negative")
         if self.type == EventType.FLIGHT_DIVERTED and not self.diversion_airport:
             raise ValueError("FLIGHT_DIVERTED requires diversion_airport")
+        if self.type == EventType.STAGE_UPDATED and (
+                not isinstance(self.new_stage, TransportStage) or not self.new_location):
+            raise ValueError("STAGE_UPDATED requires new_stage and new_location")
 
 
 @dataclass
@@ -116,6 +134,7 @@ class MissionState:
     event_history: list[dict] = field(default_factory=list)
     current_flight_cancelled: bool = False
     diverted_to: str | None = None
+    destination_airport: str | None = None
 
     def __post_init__(self) -> None:
         _aware(self.deadline, "deadline")
@@ -181,30 +200,54 @@ def generate_alternative_routes(state: MissionState, event: DisruptionEvent,
     now = event.occurred_at
     onboard = state.stage == TransportStage.ONBOARD
     flight = state.current_flight
+
+    def access_to(airport: str) -> tuple[GroundOption | None, bool]:
+        if state.stage == TransportStage.ONBOARD and flight is not None and airport == flight.origin:
+            return None, True
+        if airport == state.current_location:
+            return None, True
+        if state.stage == TransportStage.ORIGIN:
+            access = next((g for g in catalog.ground
+                           if g.origin == state.current_location and g.destination == airport), None)
+            return access, access is not None
+        return None, False
+
     if flight is not None:
+        access, accessible = access_to(flight.origin)
+        arrival_ground = next((g for g in catalog.ground
+                               if g.origin == flight.destination_airport and g.destination == state.destination), None)
         routes.append({"strategy": "CONTINUE_CURRENT_FLIGHT", "flight": flight,
-                       "ground": None, "requires_switch": False})
+                       "ground": arrival_ground, "access_ground": access, "access_missing": not accessible,
+                       "requires_switch": False})
     if not onboard:
-        ready = now + timedelta(minutes=state.handling_minutes)
         for alternative in catalog.flights:
             if alternative.flight_id == (flight.flight_id if flight else None):
                 continue
-            if alternative.origin != state.current_location or alternative.departure < ready:
+            access, accessible = access_to(alternative.origin)
+            if not accessible:
+                continue
+            ready = now + timedelta(minutes=state.handling_minutes +
+                                    (access.duration_minutes if access else 0))
+            if alternative.departure < ready:
                 continue
             ground = next((g for g in catalog.ground
                            if g.origin == alternative.destination_airport and g.destination == state.destination), None)
             if alternative.destination_airport != state.destination and ground is None:
                 continue
-            strategy = ("ALTERNATIVE_DIRECT_FLIGHT" if alternative.destination_airport == state.destination
+            strategy = ("ALTERNATIVE_DIRECT_FLIGHT" if alternative.destination_airport in
+                        (state.destination, state.destination_airport)
                         else "NEARBY_AIRPORT_GROUND_TRANSFER")
             routes.append({"strategy": strategy, "flight": alternative, "ground": ground,
+                           "access_ground": access, "access_missing": False,
                            "requires_switch": True})
         for ground in catalog.ground:
             if ground.origin == state.current_location and ground.destination == state.destination:
                 routes.append({"strategy": "DIRECT_GROUND", "flight": None, "ground": ground,
+                               "access_ground": None, "access_missing": False,
                                "requires_switch": True})
     routes.append({"strategy": "SPECIALIZED_TRANSPORT_ESCALATION", "flight": None,
-                   "ground": None, "requires_switch": True})
+                   "ground": None, "access_ground": None, "access_missing": False,
+                   "requires_switch": True})
     return routes
 
 
@@ -214,10 +257,20 @@ def estimate_route_arrival(state: MissionState, event: DisruptionEvent, route: d
     strategy = route["strategy"]
     flight: Flight | None = route["flight"]
     ground: GroundOption | None = route["ground"]
+    access: GroundOption | None = route.get("access_ground")
     timeline: list[dict] = []
     if strategy == "SPECIALIZED_TRANSPORT_ESCALATION":
         return {"estimated_delivery": None, "timeline": timeline}
     if flight is not None:
+        if route.get("access_missing"):
+            return {"estimated_delivery": None, "timeline": timeline}
+        if access is not None:
+            leave = now + timedelta(minutes=state.handling_minutes)
+            airport_ready = leave + timedelta(minutes=access.duration_minutes)
+            timeline.extend([_step("origin_handling", now, leave, state.current_location),
+                             _step("departure_airport_transfer", leave, airport_ready, flight.origin)])
+            if airport_ready > flight.departure:
+                return {"estimated_delivery": None, "timeline": timeline}
         if strategy == "CONTINUE_CURRENT_FLIGHT":
             if state.current_flight_cancelled or state.diverted_to:
                 return {"estimated_delivery": None, "timeline": timeline}
@@ -228,6 +281,8 @@ def estimate_route_arrival(state: MissionState, event: DisruptionEvent, route: d
         else:
             start = flight.departure
             arrival = flight.arrival
+        if arrival < start:
+            return {"estimated_delivery": None, "timeline": timeline}
         timeline.append(_step("flight", start, arrival, flight.destination_airport))
         handling_end = arrival + timedelta(minutes=state.handling_minutes)
         timeline.append(_step("arrival_handling", arrival, handling_end, flight.destination_airport))
@@ -254,6 +309,7 @@ def evaluate_route_feasibility(state: MissionState, event: DisruptionEvent, rout
     strategy = route["strategy"]
     flight: Flight | None = route["flight"]
     ground: GroundOption | None = route["ground"]
+    access: GroundOption | None = route.get("access_ground")
     requirements: list[str] = []
     reasons: list[str] = []
     executable = True
@@ -263,6 +319,9 @@ def evaluate_route_feasibility(state: MissionState, event: DisruptionEvent, rout
     if strategy == "CONTINUE_CURRENT_FLIGHT" and (state.current_flight_cancelled or state.diverted_to):
         executable = False
         reasons.append("Original flight cannot complete the planned route")
+    if route.get("access_missing"):
+        executable = False
+        reasons.append("No documented transfer from current location to departure airport")
     if strategy == "SPECIALIZED_TRANSPORT_ESCALATION":
         requirements.append("Specialized transport dispatch, route, capacity, and ETA must be confirmed")
     if flight is not None:
@@ -270,10 +329,19 @@ def evaluate_route_feasibility(state: MissionState, event: DisruptionEvent, rout
             requirements.extend([f"Verify {flight.flight_id} schedule and availability",
                                  f"Confirm {flight.carrier} accepts this organ shipment"])
         requirements.append("Confirm airport handoff and custody")
+        if flight.expires_at is not None and flight.expires_at < event.occurred_at:
+            requirements.append(f"Refresh stale flight information for {flight.flight_id}")
+    if access is not None:
+        if not access.verified:
+            requirements.append(f"Confirm departure transfer from {access.origin} to {access.destination}")
+        if access.expires_at is not None and access.expires_at < event.occurred_at:
+            requirements.append("Refresh stale departure transfer information")
     if ground is not None:
         if not ground.verified:
             requirements.append(f"Confirm ground carrier and travel time from {ground.origin}")
         requirements.append("Confirm ground handoff and custody")
+        if ground.expires_at is not None and ground.expires_at < event.occurred_at:
+            requirements.append("Refresh stale ground information")
     if flight is not None and ground is None:
         requirements.append("Confirm destination ground transfer and travel time")
     eta = estimate["estimated_delivery"]
@@ -291,26 +359,42 @@ def evaluate_route_feasibility(state: MissionState, event: DisruptionEvent, rout
 
 
 def rank_recovery_options(options: list[dict]) -> list[dict]:
-    """Prefer executable options, lower known flight risk, margin, and fewer handoffs."""
+    """Hard feasibility first, then verified logistics, margin, flight risk and handoffs."""
     def key(option: dict) -> tuple:
         risk = option["flight_disruption_risk"]["probability"]
         margin = option["feasibility"]["deadline_margin_minutes"]
         return (option["feasibility"]["status"] == "INFEASIBLE",
-                risk is None, risk if risk is not None else 1,
+                len(option["feasibility"]["verification_requirements"]),
                 -(margin if margin is not None else -10**9),
-                option["handoff_count"], len(option["feasibility"]["verification_requirements"]))
+                risk is None and option["flight"] is not None,
+                risk if risk is not None else 0,
+                option["handoff_count"])
     ranked = sorted(options, key=key)
     for index, option in enumerate(ranked, 1):
         option["rank"] = index
     return ranked
 
 
+def _ground_json(ground: GroundOption) -> dict:
+    return {**asdict(ground),
+            "observed_at": ground.observed_at.isoformat() if ground.observed_at else None,
+            "expires_at": ground.expires_at.isoformat() if ground.expires_at else None}
+
+
 def process_disruption(state: MissionState, event: DisruptionEvent,
                        catalog: TransportCatalog | None = None,
-                       flight_risk_predictor: FlightRiskPredictor | None = None) -> dict:
+                       flight_risk_predictor: FlightRiskPredictor | None = None,
+                       provider_configured: bool = False) -> dict:
     """Apply an event to mission state and return a JSON-serializable recovery report."""
     if not state.simulation_mode:
         raise ValueError("Disruption simulation requires mission.simulation_mode=True")
+    catalog = catalog or TransportCatalog()
+    sources = [catalog.source, *(f.source for f in catalog.flights),
+               *(g.source for g in catalog.ground)]
+    if state.current_flight:
+        sources.append(state.current_flight.source)
+    if not provider_configured and any(source != "hypothetical_demo" for source in sources):
+        raise ValueError("non-demo transport data requires an explicitly configured provider")
     if state.event_history and event.occurred_at < datetime.fromisoformat(state.event_history[-1]["occurred_at"]):
         raise ValueError("events must be applied in chronological order")
     if state.current_flight is None:
@@ -337,13 +421,21 @@ def process_disruption(state: MissionState, event: DisruptionEvent,
         state.current_expected_arrival = event.updated_eta
         if state.stage == TransportStage.TRANSFER:
             state.current_location = event.diversion_airport
+    elif event.type == EventType.STAGE_UPDATED:
+        if event.new_stage == TransportStage.ONBOARD and state.current_flight_cancelled:
+            raise ValueError("cannot board a cancelled flight")
+        if event.new_stage == TransportStage.TRANSFER and state.diverted_to != event.new_location:
+            raise ValueError("transfer location must match the diversion airport")
+        state.stage = event.new_stage
+        state.current_location = event.new_location
     else:
         raise ValueError("unsupported event type")
     state.event_history.append({"type": event.type.value, "occurred_at": event.occurred_at.isoformat(),
                                 "updated_eta": event.updated_eta.isoformat() if event.updated_eta else None,
                                 "delay_minutes": event.delay_minutes,
-                                "diversion_airport": event.diversion_airport})
-    catalog = catalog or TransportCatalog()
+                                "diversion_airport": event.diversion_airport,
+                                "new_stage": event.new_stage.value if event.new_stage else None,
+                                "new_location": event.new_location})
     options = []
     for i, route in enumerate(generate_alternative_routes(state, event, catalog), 1):
         estimate = estimate_route_arrival(state, event, route)
@@ -353,13 +445,17 @@ def process_disruption(state: MissionState, event: DisruptionEvent,
             "probability": None, "source": "not_applicable", "scope": "commercial_flight_disruption"}
         options.append({"candidate_id": f"{state.mission_id}-{len(state.event_history)}-{i}",
                         "strategy": route["strategy"], "flight": ({**asdict(flight),
-                            "departure": flight.departure.isoformat(), "arrival": flight.arrival.isoformat()}
+                            "departure": flight.departure.isoformat(), "arrival": flight.arrival.isoformat(),
+                            "observed_at": flight.observed_at.isoformat() if flight.observed_at else None,
+                            "expires_at": flight.expires_at.isoformat() if flight.expires_at else None}
                             if flight else None),
-                        "ground": asdict(route["ground"]) if route["ground"] else None,
+                        "ground": _ground_json(route["ground"]) if route["ground"] else None,
+                        "access_ground": _ground_json(route["access_ground"]) if route["access_ground"] else None,
                         "estimated_delivery": (estimate["estimated_delivery"].isoformat()
                                                if estimate["estimated_delivery"] else None),
                         "timeline": estimate["timeline"], "flight_disruption_risk": risk,
-                        "handoff_count": (1 if flight else 0) + (1 if route["ground"] else 0),
+                        "handoff_count": (1 if flight else 0) + (1 if route["ground"] else 0)
+                                         + (1 if route["access_ground"] else 0),
                         "feasibility": feasibility})
     ranked = rank_recovery_options(options)
     original = next((o for o in ranked if o["strategy"] == "CONTINUE_CURRENT_FLIGHT"), None)
@@ -378,12 +474,17 @@ def process_disruption(state: MissionState, event: DisruptionEvent,
                                        "remaining_minutes": calculate_remaining_time(state, event.occurred_at),
                                        "current_flight": ({**asdict(state.current_flight),
                                            "departure": state.current_flight.departure.isoformat(),
-                                           "arrival": state.current_flight.arrival.isoformat()}),
+                                           "arrival": state.current_flight.arrival.isoformat(),
+                                           "observed_at": state.current_flight.observed_at.isoformat()
+                                           if state.current_flight.observed_at else None,
+                                           "expires_at": state.current_flight.expires_at.isoformat()
+                                           if state.current_flight.expires_at else None}),
                                        "current_expected_arrival": (state.current_expected_arrival.isoformat()
                                                                     if state.current_expected_arrival else None),
                                        "handling_minutes": state.handling_minutes,
                                        "ground_transfer_minutes": state.ground_transfer_minutes,
                                        "diverted_to": state.diverted_to,
+                                       "destination_airport": state.destination_airport,
                                        "event_count": len(state.event_history)},
             "original_plan_assessment": original, "alternative_plans": [o for o in ranked if o is not original],
             "ranked_recommendation_candidates": recommendations,

@@ -97,6 +97,9 @@ class RecoveryTests(unittest.TestCase):
         unsupported = process_disruption(mission(), DisruptionEvent(EventType.FLIGHT_DELAYED, START,
                                          delay_minutes=30), flight_risk_predictor=lambda flight: None)
         self.assertIsNone(unsupported["original_plan_assessment"]["flight_disruption_risk"]["probability"])
+        with self.assertRaises(ValueError):
+            process_disruption(mission(), DisruptionEvent(EventType.FLIGHT_DELAYED, START,
+                               delay_minutes=30), TransportCatalog(source="unconfigured_provider"))
 
     def test_negative_remaining_time(self):
         state = mission(deadline=START - timedelta(minutes=1))
