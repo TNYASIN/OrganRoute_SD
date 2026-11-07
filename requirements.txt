@@ -6,3 +6,4 @@ openai
 google-genai
 python-dotenv
 certifi
+twilio
