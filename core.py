@@ -189,11 +189,48 @@ def delay_slice(df: pd.DataFrame, origin: str, airline: str, dep_hour: int) -> t
     return df, "all flights to SAN"
 
 
+# --- Calibrated ML model (model.py, ml-model branch) -------------------------------------------
+# Used for planned flights when its saved file loads; otherwise (or with USE_ML_MODEL=0 in .env)
+# the empirical estimate below is used. Saved with scikit-learn 1.6.1: other versions may not load it.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+try:
+    import functools as _functools
+    import model as _ml
+    _ml._load_model = _functools.lru_cache(maxsize=2)(_ml._load_model)  # load the file once, not per call
+    _ML_PATH = os.path.join(_HERE, _ml.MODEL_PATH)
+    if not os.path.exists(_ML_PATH):
+        _ml = None
+except Exception:
+    _ml = None
+
+
+def ml_enabled() -> bool:
+    return _ml is not None and os.environ.get("USE_ML_MODEL", "1") != "0"
+
+
+@_functools.lru_cache(maxsize=4096) if _ml is not None else (lambda f: f)
+def _ml_p(origin: str, airline: str, hour: int, dow: int, month: int, slack: int) -> float | None:
+    """P(completed and arriving within `slack` min) from the calibrated model; None if it fails."""
+    if slack < 0:
+        return 0.0  # even an on-time arrival misses the deadline
+    try:
+        r = _ml.predict_risk(origin, airline, hour, dow, month, slack_minutes=min(slack, 240), model_path=_ML_PATH)
+        return float(r["probability_arrive_within_slack"])
+    except Exception:
+        return None
+
+
 def p_on_time(df: pd.DataFrame, origin: str, airline: str, dep_hour: int,
-              slack_min: float, already_delayed_min: float = 0) -> dict:
+              slack_min: float, already_delayed_min: float = 0, when: datetime | None = None) -> dict:
     """Probability the flight arrives with ArrDelay <= slack_min and isn't cancelled.
-    If already_delayed_min > 0, condition on delay >= that (known delay)."""
+    With `when` (departure date) and no known delay, the calibrated ML model is used when available.
+    If already_delayed_min > 0, condition on delay >= that (known delay; empirical only)."""
     sub, label = delay_slice(df, origin, airline, dep_hour)
+    if when is not None and already_delayed_min <= 0 and ml_enabled():
+        p = _ml_p(origin, airline, int(dep_hour), when.isoweekday(), when.month, int(slack_min))
+        if p is not None:
+            return {"p": round(p, 3), "n": int(len(sub)), "basis": f"ML model (calibrated) · history {label}",
+                    "p_late_60": None, "cancel_rate": None}
     flown = sub[sub.Cancelled == 0]
     cancel_rate = sub.Cancelled.mean() if len(sub) else 0.02
     delays = flown.ArrDelay.to_numpy()
@@ -261,7 +298,7 @@ def commercial_options(df, origin, hospital, ready_at_airport: datetime, dl: dat
     offset_h = AIRPORTS[origin][2]
     sched = _schedule(df, origin)
     to_hosp = HOSPITALS[hospital][0]
-    out = []
+    cands = []
     for day in (0, 1):
         base = ready_at_airport.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=day)
         for _, r in sched.iterrows():
@@ -272,13 +309,16 @@ def commercial_options(df, origin, hospital, ready_at_airport: datetime, dl: dat
             arr_sd = dep_sd + timedelta(minutes=float(r.CRSElapsedTime))
             at_hosp = arr_sd + timedelta(minutes=to_hosp)
             slack = (dl - at_hosp).total_seconds() / 60  # minutes of delay we can absorb
-            m = p_on_time(df, origin, r.Reporting_Airline, hh, slack, known_delay_min)
-            out.append((dep_sd, Option(
-                "Commercial",
-                f"{CARRIER_NAMES.get(r.Reporting_Airline, r.Reporting_Airline)} {origin}->SAN dep {hh:02d}:{mm:02d} local",
-                _fmt(dep_sd), _fmt(at_hosp), int(slack), m["p"], "$", f"{m['basis']} (n={m['n']})")))
-    out.sort(key=lambda t: t[0])  # chronological: next departures first
-    return [o for _, o in out[:n]]
+            cands.append((dep_sd, r.Reporting_Airline, hh, mm, at_hosp, slack))
+    cands.sort(key=lambda t: t[0])  # chronological: next departures first; score only the ones shown
+    out = []
+    for dep_sd, airline, hh, mm, at_hosp, slack in cands[:n]:
+        m = p_on_time(df, origin, airline, hh, slack, known_delay_min, when=dep_sd)
+        out.append(Option(
+            "Commercial",
+            f"{CARRIER_NAMES.get(airline, airline)} {origin}->SAN dep {hh:02d}:{mm:02d} local",
+            _fmt(dep_sd), _fmt(at_hosp), int(slack), m["p"], "$", f"{m['basis']} (n={m['n']})"))
+    return out
 
 
 # ---------------------------------------------------------------------------
